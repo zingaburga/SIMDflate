@@ -185,6 +185,7 @@ static void huffman_encode(
 		code_bits = _mm512_mask_permutexvar_epi8(code_bits, m_lendist, data, xsymlen);
 		// add in extra bit lengths
 		code_bits = _mm512_mask_blend_epi8(m_xbits, code_bits, data);
+		assert(_mm512_cmpgt_epu8_mask(code_bits, _mm512_set1_epi8(15)) == 0);
 		
 		// TODO: if all code_bits <= 8, consider skipping codehi
 		
@@ -205,17 +206,26 @@ static void huffman_encode(
 		// combine codelo/hi together
 		auto code0 = _mm512_unpacklo_epi8(codelo, codehi);
 		auto code1 = _mm512_unpackhi_epi8(codelo, codehi);
+		// instead of tracking code bit lengths, it's easier for us to track unoccupied bits, so compute relevant 'emptylen' for elements
 		auto emptylen = _mm512_sub_epi8(_mm512_set1_epi8(16), code_bits);
 		auto emptylen0 = _mm512_unpacklo_epi8(emptylen, _mm512_setzero_si512());
 		auto emptylen1 = _mm512_unpackhi_epi8(emptylen, _mm512_setzero_si512());
 		
+		// concatenate 4x 16b elements into 64b elements
 		code0 = huffman_bitjoin_16_64(code0, emptylen0);
 		code1 = huffman_bitjoin_16_64(code1, emptylen1);
 		
+		// for compression to be effective, we generally expect <= 8 bits per symbol on average
+		// if this is the case, we can take a shortcut
 		emptylen = _mm512_sad_epu8(emptylen, _mm512_setzero_si512());
-		auto longCodes = _mm512_cmplt_epi8_mask(emptylen, _mm512_set1_epi64(64));
-		if(!longCodes) {
-			// combine into one vector
+		assert(_mm512_cmpgt_epu64_mask(emptylen, _mm512_set1_epi64(128)) == 0); // TODO: this check is probably too loose
+		assert(_mm512_cmplt_epu64_mask(emptylen, _mm512_set1_epi64(8)) == 0);
+		//auto long_codes = _mm512_testn_epi8_mask(emptylen, _mm512_set1_epi64(192)); // emptylen < 64
+		auto long_codes = _mm512_cmplt_epi8_mask(emptylen, _mm512_set1_epi64(64));
+		if(!long_codes) {
+			// since 8 symbols consume <=64b, we can combine everything into one vector
+			
+			// concatenate 2x64b elements into 1x64b
 			emptylen0 = _mm512_unpacklo_epi64(emptylen0, emptylen1);
 			emptylen0 = _mm512_sad_epu8(emptylen0, _mm512_setzero_si512());
 			auto code0_ = _mm512_unpacklo_epi64(code0, code1);
@@ -223,6 +233,7 @@ static void huffman_encode(
 			code0_ = _mm512_sllv_epi64(code0_, emptylen0);
 			code0 = _mm512_shrdv_epi64(code0_, code1_, emptylen0);
 			
+			// 64b -> 512b
 			int total_len;
 			// TODO: this subtract 64 is probably unnecessary
 			code0 = huffman_bitjoin_64_512(code0, _mm512_sub_epi64(emptylen, _mm512_set1_epi64(64)), total_len);
@@ -231,15 +242,17 @@ static void huffman_encode(
 			emptylen0 = _mm512_sad_epu8(emptylen0, _mm512_setzero_si512());
 			emptylen1 = _mm512_sad_epu8(emptylen1, _mm512_setzero_si512());
 			int total_len0, total_len1;
-			// fix up permutation caused by unpacklo/hi
+			
+			// fix up permutation caused by earlier unpacklo/hi
 			// TODO: see if avoiding this allows for optimisation opportunities
 			const auto PERM0 = _mm512_set_epi64(11, 10, 3, 2, 9, 8, 1, 0);
 			const auto PERM1 = _mm512_set_epi64(15, 14, 7, 6, 13, 12, 5, 4);
-			
 			auto code0_ = _mm512_permutex2var_epi64(code0, PERM0, code1);
 			auto code1_ = _mm512_permutex2var_epi64(code0, PERM1, code1);
 			auto emptylen0_ = _mm512_permutex2var_epi64(emptylen0, PERM0, emptylen1);
 			auto emptylen1_ = _mm512_permutex2var_epi64(emptylen0, PERM1, emptylen1);
+			
+			// concatenate 64b -> 512b
 			code0_ = huffman_bitjoin_64_512(code0_, emptylen0_, total_len0);
 			code1_ = huffman_bitjoin_64_512(code1_, emptylen1_, total_len1);
 			output.ZeroWrite505(code0_, total_len0);

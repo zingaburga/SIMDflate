@@ -2,9 +2,8 @@
 #define __SIMDFLATE_HUFFMANTREE_H
 
 #include "common.hh"
-#include <array>
 
-
+// 256 byte entry permute on data, with lookup table in tbl0-3
 static HEDLEY_ALWAYS_INLINE __m512i shuffle256(__m512i data, __m512i tbl0, __m512i tbl1, __m512i tbl2, __m512i tbl3) {
 	return _mm512_mask_blend_epi8(
 		_mm512_movepi8_mask(data),
@@ -13,6 +12,8 @@ static HEDLEY_ALWAYS_INLINE __m512i shuffle256(__m512i data, __m512i tbl0, __m51
 	);
 }
 
+// split 16-bit elements into low/high 8-bit elements
+// takes 16-bit inputs in in0/1 and puts the low 8 bits in outl, and the high 8 bits in outh
 static HEDLEY_ALWAYS_INLINE void pack_bytes(__m512i in0, __m512i in1, __m512i& outl, __m512i& outh) {
 	const auto PACK_PERM = VEC512_8(((_x&31)<<1) | ((_x&32) >> 5));
 	in0 = _mm512_permutexvar_epi8(PACK_PERM, in0);
@@ -31,6 +32,7 @@ static HEDLEY_ALWAYS_INLINE void pack_bytes(__m512i in0, __m512i in1, __m512i& o
 }
 
 
+// pre-computed lookup table for {0, 1/1, 1/3, 1/7, 1/15 ...}
 constexpr uint32_t divide_gen(unsigned n) {
 	if(n == 0) return 0;
 	if(n == 1) return 1<<31;
@@ -43,42 +45,50 @@ static constexpr auto TO_MAX_DIVIDE = lut<16>(divide_gen);
 template<int size, int max_length>
 class HuffmanTree {
 	
+	/// Histogram helpers
+	
+	//  for small alphabet histogramming, it can be done by testing for each letter of the alphabet, and counting the matches
 	static HEDLEY_ALWAYS_INLINE __m128i hist_match_pair(__m512i data, int n) {
 		auto match0 = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(n)));
 		auto match1 = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(n+1)));
 		return _mm_insert_epi64(_mm_cvtsi64_si128(match0), match1, 1);
 	}
+	// like above function, but if `data` has <= 32 elements, we can do two matches at once with 512-bit vectors
 	static HEDLEY_ALWAYS_INLINE __m128i hist_match_pair_x2(__m512i data, int n) {
 		auto match0 = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(data, VEC512_8(_x/32+n)));
 		auto match1 = _cvtmask64_u64(_mm512_cmpeq_epi8_mask(data, VEC512_8(_x/32+n+2)));
 		return _mm_insert_epi64(_mm_cvtsi64_si128(match0), match1, 1);
 	}
-	static HEDLEY_ALWAYS_INLINE __m512i hist_match_8(__m512i data, int n) {
-		return _mm512_inserti64x4(
-			_mm512_castsi256_si512(_mm256_inserti128_si256(
-				_mm256_castsi128_si256(hist_match_pair(data, n)),
-				hist_match_pair(data, n+2), 1
-			)),
-			_mm256_inserti128_si256(
-				_mm256_castsi128_si256(hist_match_pair(data, n+4)),
-				hist_match_pair(data, n+6), 1
-			), 1
-		);
-	}
+	
+	/// Sorting helpers
+	
+	// moves masked bytes to the low-value side of the vector (like compress), and unmasked bytes to the high-value side
+	// original order of bytes is otherwise preserved
 	static HEDLEY_ALWAYS_INLINE __m512i splice_i8(__m512i data, __mmask64 lo_elems) {
-		auto lo = _mm512_maskz_compress_epi8(lo_elems, data);
 		auto hi = _mm512_maskz_compress_epi8(_knot_mask64(lo_elems), data);
-		
+		/*
+		auto lo = _mm512_maskz_compress_epi8(lo_elems, data);
 		uint64_t expmask = ~0ULL << _mm_popcnt_u64(_cvtmask64_u64(lo_elems));
 		return _mm512_mask_expand_epi8(lo, _cvtu64_mask64(expmask), hi);
+		*/
+		auto shift_idx = _mm512_set1_epi8(_mm_popcnt_u64(_cvtmask64_u64((lo_elems))));
+		shift_idx = _mm512_sub_epi8(VEC512_8(_x), shift_idx);
+		hi = _mm512_permutexvar_epi8(shift_idx, hi);
+		return _mm512_mask_compress_epi8(hi, lo_elems, data);
 	}
 	static HEDLEY_ALWAYS_INLINE __m512i splice_i16(__m512i data, __mmask32 lo_elems) {
-		auto lo = _mm512_maskz_compress_epi16(lo_elems, data);
 		auto hi = _mm512_maskz_compress_epi16(_knot_mask32(lo_elems), data);
-		
+		/*
+		auto lo = _mm512_maskz_compress_epi16(lo_elems, data);
 		uint32_t expmask = ~0U << _mm_popcnt_u32(_cvtmask32_u32(lo_elems));
 		return _mm512_mask_expand_epi16(lo, _cvtu32_mask32(expmask), hi);
+		*/
+		auto shift_idx = _mm512_set1_epi16(_mm_popcnt_u32(_cvtmask32_u32((lo_elems))));
+		shift_idx = _mm512_sub_epi16(VEC512_16(_x), shift_idx);
+		hi = _mm512_permutexvar_epi16(shift_idx, hi);
+		return _mm512_mask_compress_epi16(hi, lo_elems, data);
 	}
+	// faster versions of above, for when we know half the elements go on either side
 	static HEDLEY_ALWAYS_INLINE __m512i splicehalf_i8(__m512i data, __mmask64 lo_elems) {
 		assert(_mm_popcnt_u64(_cvtmask64_u64(lo_elems)) == 32);
 		auto lo = _mm512_maskz_compress_epi8(lo_elems, data);
@@ -116,6 +126,7 @@ class HuffmanTree {
 		*/
 		// sort first bit
 		auto swap = _mm512_test_epi32_mask(si, _mm512_set1_epi32(256));
+		assert(_mm_popcnt_u32(_cvtmask32_u32(swap)) == 16);
 		si = _mm512_mask_rol_epi32(si, swap, si, 16);
 		return si;
 	}
@@ -154,6 +165,7 @@ class HuffmanTree {
 	}
 	*/
 	
+	/// Bit writing helpers
 	static HEDLEY_ALWAYS_INLINE void bit_write64(void* output, uint64_t data, int len, uint_fast8_t& byte, int bits) {
 		uint64_t out_data = (data << bits) | byte;
 		memcpy(output, &out_data, sizeof(out_data));
@@ -191,6 +203,9 @@ class HuffmanTree {
 			memcpy(output, &out_data, 4);
 		}
 	}
+	
+	// inverse of pack_bytes
+	// takes low/high bytes from inl and inh, returns joined 16-bit elements in out0 and out1
 	static HEDLEY_ALWAYS_INLINE void unpack_bytes(__m512i inl, __m512i inh, __m512i& out0, __m512i& out1) {
 		const auto SEP_PERM = VEC512_8((_x&7) | ((_x&8) << 2) | ((_x&48) >> 1));
 		inl = _mm512_permutexvar_epi8(SEP_PERM, inl);
@@ -199,6 +214,7 @@ class HuffmanTree {
 		out1 = _mm512_unpackhi_epi8(inl, inh);
 	}
 	
+	// lookup over 1-4x 64-byte vectors
 	template<int num_sym>
 	static HEDLEY_ALWAYS_INLINE __m512i ShuffleIdx(__m512i data, __m512i idx0, __m512i idx1, __m512i idx2, __m512i idx3) {
 		if(num_sym == 64)
@@ -509,8 +525,7 @@ class HuffmanTree {
 			// it's unlikely we'll need to scan all bits, so bail early in most cases
 			auto continue_sort = _mm512_mask_test_epi16_mask(
 				valid_mask,
-				sc,
-				_mm512_set1_epi16(-1<<SHORT_ROUNDS)
+				sc, _mm512_set1_epi16(int16_t(0xffff<<SHORT_ROUNDS))
 			);
 			if(HEDLEY_UNLIKELY(!_ktestz_mask32_u8(continue_sort, continue_sort))) {
 				for(int i=SHORT_ROUNDS; i<MAX_ROUNDS; i++) {
@@ -521,7 +536,8 @@ class HuffmanTree {
 			
 			_mm512_store_si512(sym_index, idx);
 			_mm512_store_si512(hist_sorted, _mm512_permutexvar_epi16(idx, sc));
-		} else if(size == 286) {
+		} else {
+			assert(size == 286);
 			
 			const auto LAST_MASK = _cvtu32_mask32((1 << 30) -1);
 			// unless we've got totally random data, there's a good chance that many symbols are unused
@@ -598,19 +614,26 @@ class HuffmanTree {
 				// not enough skipped items - do a full sort
 				SortHistLitlen<288>(sym_counts, sym_index, hist_sorted);
 			}
-		} else {
-			// this code never actually occurs, but we'll leave it here for good measure
+		}
+		
+#ifndef NDEBUG
+		{ // double-check sorting
+			uint16_t check_index[size], check_hist[size];
 			for(int i=0; i<size; i++)
-				sym_index[i] = i;
-			std::sort(sym_index, sym_index + size, [&](uint16_t a, uint16_t b) {
-				// for now, enforce a consistent sort across sort implementations; TODO: remove this eventually
+				check_index[i] = i;
+			std::sort(check_index, check_index + size, [&](uint16_t a, uint16_t b) {
+				// order by histogram value, then by symbol index
 				if(sym_counts[a] == sym_counts[b])
 					return a < b;
 				return sym_counts[a] < sym_counts[b];
 			});
 			for(int i=0; i<size; i++)
-				hist_sorted[i] = sym_counts[sym_index[i]];
+				check_hist[i] = sym_counts[check_index[i]];
+			
+			assert(memcmp(sym_index, check_index, sizeof(check_index)) == 0);
+			assert(memcmp(hist_sorted, check_hist, sizeof(check_hist)) == 0);
 		}
+#endif
 		
 		// skip zeroes
 		while(size - skipped_sym > 0) {
@@ -1113,7 +1136,7 @@ public:
 					return _cvtmask64_u64(len_match);
 				};
 				auto cmp_2round = [&]() -> __m128i {
-					// TODO: consider pre-expanding hist to use VPERMD instead of VPERMW
+					// TODO: consider pre-expanding hist to use VPERMD instead of VPERMW, or maybe pre-shuffle it around so PSHUFB works
 					auto cmp0 = cmp_round(_mm512_permutexvar_epi16(perm, hist));
 					perm = _mm512_add_epi16(perm, _mm512_set1_epi16(2));
 					auto cmp1 = cmp_round(_mm512_permutexvar_epi16(perm, hist));
@@ -1485,6 +1508,18 @@ public:
 			auto count16_17 = _mm_setzero_si128();
 			int count18 = 0;
 			loop_u8x64(table_len, data, _mm512_set1_epi8(-128), [&](__m512i sym, uint64_t, size_t) {
+				auto hist_match_8 = [](__m512i data, int n) -> __m512i {
+					return _mm512_inserti64x4(
+						_mm512_castsi256_si512(_mm256_inserti128_si256(
+							_mm256_castsi128_si256(hist_match_pair(data, n)),
+							hist_match_pair(data, n+2), 1
+						)),
+						_mm256_inserti128_si256(
+							_mm256_castsi128_si256(hist_match_pair(data, n+4)),
+							hist_match_pair(data, n+6), 1
+						), 1
+					);
+				};
 				count0_7 = _mm512_add_epi32(count0_7, _mm512_popcnt_epi64(hist_match_8(sym, 0)));
 				count8_15 = _mm512_add_epi32(count8_15, _mm512_popcnt_epi64(hist_match_8(sym, 8)));
 				count16_17 = _mm_add_epi32(count16_17, _mm_popcnt_epi64(hist_match_pair(sym, 16)));

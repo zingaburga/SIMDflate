@@ -85,7 +85,7 @@ static void write_dyn_block_header(BitWriter& output, const HuffmanTree<286, 15>
 		
 		// if the top bit of `data` is set, it indicates a repeat length (i.e. not a symbol)
 		//auto is_sym = _kandn_mask64(_mm512_movepi8_mask(data), is_valid_mask);
-		auto is_sym = _mm512_mask_testn_epi8_mask(is_valid_mask, data, _mm512_set1_epi8(128));
+		auto is_sym = _mm512_mask_testn_epi8_mask(is_valid_mask, data, _mm512_set1_epi8(-128));
 		// get Huffman codes, and remove top bit from repeat lengths
 		auto huff_data = _mm512_mask_permutexvar_epi8(
 			_mm512_and_si512(data, _mm512_set1_epi8(0x7f)), // repeat lengths

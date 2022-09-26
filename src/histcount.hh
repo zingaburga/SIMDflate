@@ -47,9 +47,12 @@ bool symbol_histogram(uint16_t* sym_counts, const Lz77Data& lz77output) {
 		auto lendist_bit = _mm512_maskz_mov_epi8(is_lendist, _mm512_set1_epi8(1));
 		auto data0 = _mm512_unpacklo_epi8(data, lendist_bit);
 		auto data1 = _mm512_unpackhi_epi8(data, lendist_bit);
-		// symbols should now be guaranteed to be between 0-319
-		assert(_mm512_cmpgt_epu16_mask(data0, _mm512_set1_epi16(319)) == 0);
-		assert(_mm512_cmpgt_epu16_mask(data1, _mm512_set1_epi16(319)) == 0);
+		
+		// symbols should now be guaranteed to be between 0-317, and not 286 or 287
+		assert(_mm512_cmpgt_epu16_mask(data0, _mm512_set1_epi16(317)) == 0);
+		assert(_mm512_cmpgt_epu16_mask(data1, _mm512_set1_epi16(317)) == 0);
+		assert(_mm512_cmpeq_epu16_mask(data0, _mm512_set1_epi16(286)) == 0 && _mm512_cmpeq_epu16_mask(data0, _mm512_set1_epi16(287)) == 0);
+		assert(_mm512_cmpeq_epu16_mask(data1, _mm512_set1_epi16(286)) == 0 && _mm512_cmpeq_epu16_mask(data1, _mm512_set1_epi16(287)) == 0);
 		
 		// double indices to simplify addressing during histogramming
 		data0 = _mm512_add_epi16(data0, data0);
@@ -86,8 +89,6 @@ bool symbol_histogram(uint16_t* sym_counts, const Lz77Data& lz77output) {
 		}
 	}
 	sym_counts[256] = 1; // clear out miscounted extra-bits symbols, whilst correctly setting the end-of-block count
-	if(!is_sample)
-		assert(sym_counts[286] == 0 && sym_counts[287] == 0 && sym_counts[318] == 0 && sym_counts[319] == 0);
 	return is_sample;
 }
 

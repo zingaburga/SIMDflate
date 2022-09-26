@@ -4,7 +4,6 @@
 #include "lz77data.hh"
 
 
-const size_t SIMD_MASK = sizeof(__m512i) - 1;
 const uint32_t HASH_PROD = 0x9E3779B1; // 0x9E3779B1 = 2^32 * GoldenRatio
 const size_t NICE_MATCH_LEN = 64; // max 64
 
@@ -394,7 +393,7 @@ static void lz77_encode(
 	auto _src = static_cast<const uint8_t*>(src);
 	auto src_end = _src + len;
 	
-	assert((window_offset & SIMD_MASK) == 0);
+	assert((window_offset & (sizeof(__m512i)-1)) == 0);
 	
 	if(len > sizeof(__m512i)*2) {
 		_src -= window_offset;
@@ -412,7 +411,7 @@ static void lz77_encode(
 			window_offset += sizeof(__m512i);
 		}
 		
-		auto safe_end = reinterpret_cast<const uint8_t*>(uintptr_t(src_end - sizeof(__m512i)) & ~SIMD_MASK);
+		auto safe_end = reinterpret_cast<const uint8_t*>(uintptr_t(src_end - sizeof(__m512i)) & -int(sizeof(__m512i)));
 		assert(_src < safe_end);
 		while(_src < safe_end) {
 			auto win_size = std::min(size_t(safe_end - _src), size_t(1<<WINDOW_ORDER));
