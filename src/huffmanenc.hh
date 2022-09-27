@@ -135,6 +135,20 @@ static void huffman_encode(
 		1
 	);
 	
+	// need to do a bit-rotate on lz77output.xbits_hi to make the main-loop code simpler
+	// the number of bytes in lz77output.xbits_hi is expected to be low, so doesn't make sense to try doing this in-loop
+	// it may make more sense to just overwrite lz77output.xbits_hi, but we'll retain its immutability for now
+	alignas(64) uint8_t xbits_hi_tmp[LZ77DATA_XBITS_HI_SIZE];
+	for(int i=0; i<lz77output.xbits_hi_len; i+=sizeof(__m512i)) {
+		auto data = _mm512_load_si512(lz77output.xbits_hi + i);
+		// max extra-bits length is 13 bits; since 7 is stored in the lo half, there can't be more than 6 bits set here
+		assert(_mm512_test_epi8_mask(data, _mm512_set1_epi8(0b11000000)) == 0);
+		
+		// data = data >>> 1 (where >>> denotes bytewise bit-rotate)
+		data = _mm512_gf2p8affine_epi64_epi8(data, _mm512_set1_epi64(0x0204081020408001ULL), 0);
+		_mm512_store_si512(xbits_hi_tmp + i, data);
+	}
+	
 	// compute Huffman codes
 	alignas(64) uint16_t litlen_codes[286 +2];
 	alignas(64) uint16_t dist_codes[30 +2];
@@ -172,22 +186,33 @@ static void huffman_encode(
 		xsymlo, xsymhi
 	);
 	
-	auto xbits_ptr = lz77output.xbits;
+	auto xbits_ptr = xbits_hi_tmp;
+	auto last_data = _mm512_setzero_si512();
 	for(unsigned srcpos=0; srcpos<lz77output.len; srcpos+=sizeof(__m512i)) { // overflow is not a problem, because the buffer is 0 padded
 		auto data = _mm512_load_si512(lz77output.data + srcpos);
 		auto m_data = _mm512_movepi8_mask(data);
 		auto m_lendist = _cvtu64_mask64(lz77output.is_lendist[srcpos/sizeof(__m512i)]);
 		auto m_xbits = _kandn_mask64(m_data, m_lendist);
 		
+		// shift data by a byte
+		auto data_shift = _mm512_alignr_epi8(data, _mm512_alignr_epi64(data, last_data, 6), 15);
+		last_data = data;
+		
 		// figure out literal symbol lengths
 		auto code_bits = shuffle256(data, symlen0, symlen1, symlen2, symlen3);
 		// add in length/distance symbol lengths
 		code_bits = _mm512_mask_permutexvar_epi8(code_bits, m_lendist, data, xsymlen);
 		// add in extra bit lengths
-		code_bits = _mm512_mask_blend_epi8(m_xbits, code_bits, data);
+		code_bits = _mm512_mask_permutexvar_epi8(code_bits, m_xbits, data_shift, _mm512_set_epi32(
+			// distance symbols
+			0x0d0d, 0x0c0c0b0b, 0x0a0a0909, 0x08080707, 0x06060505, 0x04040303, 0x02020101, 0,
+			// length symbols
+			0x0005, 0x05050504, 0x04040403, 0x03030302, 0x02020201, 0x01010100, 0, 0
+		));
 		assert(_mm512_cmpgt_epu8_mask(code_bits, _mm512_set1_epi8(15)) == 0);
 		
 		// TODO: if all code_bits <= 8, consider skipping codehi
+		// we could use the histogram to give an idea: if the likelihood of code_bits > 8 is low, add the check in
 		
 		// encode literal symbols
 		auto codelo = shuffle256(data, symlo0, symlo1, symlo2, symlo3);
@@ -195,12 +220,19 @@ static void huffman_encode(
 		// encode length/distance symbols
 		codelo = _mm512_mask_permutexvar_epi8(codelo, m_lendist, data, xsymlo);
 		codehi = _mm512_mask_permutexvar_epi8(codehi, m_lendist, data, xsymhi);
+		assert(_mm512_test_epi8_mask(codehi, _mm512_set1_epi8(-128)) == 0); // max symbol length is 15 bits, so top bit should always be 0
 		
-		// insert length/distance extra bits into codelo
-		codelo = _mm512_mask_expandloadu_epi8(codelo, m_xbits, xbits_ptr);
-		xbits_ptr += _mm_popcnt_u64(_cvtmask64_u64(m_xbits));
-		// zero out extra bits in codehi
-		codehi = _mm512_mask_sub_epi8(codehi, m_xbits, codehi, codehi);
+		// blend in length/distance extra bits into codelo
+		codelo = _mm512_mask_mov_epi8(codelo, m_xbits, data);
+		// insert for codehi
+		auto has_hi_xbits = _mm512_mask_test_epi8_mask(m_xbits, code_bits, _mm512_set1_epi8(8));
+		codehi = _mm512_mask_expandloadu_epi8(codehi, has_hi_xbits, xbits_ptr);
+		xbits_ptr += _mm_popcnt_u64(_cvtmask64_u64(has_hi_xbits));
+		
+		// codelo can only hold 7 xbits, so we need to move one bit from codehi to it
+		const auto VALID_CODEHI_BITS = _mm512_set1_epi8(127);
+		codelo = _mm512_ternarylogic_epi64(codelo, codehi, VALID_CODEHI_BITS, 0xf4); // A | (B & ~C)
+		codehi = _mm512_and_si512(codehi, VALID_CODEHI_BITS);
 		
 		
 		// combine codelo/hi together

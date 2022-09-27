@@ -149,7 +149,7 @@ static HEDLEY_ALWAYS_INLINE void lz77_set_matches(
 
 template<bool first_vec>
 static unsigned lz77_vec(__m512i data, __m128i data2, uint32_t* match_offsets, const uint8_t* HEDLEY_RESTRICT search_base, uint16_t search_base_offset, unsigned& skip_til_index,
-	uint8_t* HEDLEY_RESTRICT output, uint8_t* HEDLEY_RESTRICT& out_xbits, BitWriter& is_lendist) {
+	uint8_t* HEDLEY_RESTRICT output, uint8_t* HEDLEY_RESTRICT& out_xbits_hi, BitWriter& is_lendist) {
 	
 	// detect ranges 48-57 (0-9), 65-90 (A-Z), 97-122 (a-z)
 	auto alphanum = _cvtmask64_u64(_mm512_test_epi8_mask(data, _mm512_permutexvar_epi8(
@@ -332,27 +332,19 @@ static unsigned lz77_vec(__m512i data, __m128i data2, uint32_t* match_offsets, c
 			output[lendist_pos++] = 128 + lz77_length_symbol(len, len_xbits);
 			if(len_xbits > 0) {
 				assert(len_xbits <= 5);
-				output[lendist_pos++] = len_xbits;
-				*out_xbits++ = _bzhi_u32(len-3, len_xbits);
+				output[lendist_pos++] = _bzhi_u32(len-3, len_xbits);
 			}
 			output[lendist_pos++] = 160 + lz77_distance_symbol(off, len_xbits);
 			if(len_xbits > 0) {
 				auto len_xbits_bytes = 1;
 				uint16_t xbits = _bzhi_u32(off-1, len_xbits);
 				assert(len_xbits <= 13);
-				// split xbits such that there's no more than 7 per byte (top bit is reserved)
-				// TODO: why is top bit reserved again?
-				if(len_xbits > 7) {
-					len_xbits = ((len_xbits-7)<<8) | 7;
-					xbits = _pdep_u32(xbits, 0x7f7f);
-					len_xbits_bytes = 2;
-				}
-				memcpy(output + lendist_pos, &len_xbits, 2);
-				memcpy(out_xbits, &xbits, 2);
-				lendist_pos += len_xbits_bytes;
-				out_xbits += len_xbits_bytes;
+				// xbits is split across output and xbits_hi
+				output[lendist_pos++] = xbits & 0x7f;
+				*out_xbits_hi = xbits >> 7;
+				out_xbits_hi += (len_xbits >> 3);
 			}
-			is_lendist.Write57(_bzhi_u32(31, lendist_pos - outpos), lendist_pos - outpos);
+			is_lendist.Write57(_bzhi_u32(15, lendist_pos - outpos), lendist_pos - outpos);
 			assert(lendist_pos - outpos <= 5 && lendist_pos - outpos >= 2);
 			outpos = lendist_pos;
 			
@@ -389,7 +381,7 @@ static void lz77_encode(
 	ChecksumClass& cksum
 ) {
 	BitWriter is_lendist_writer(output.is_lendist);
-	auto* xbits_ptr = output.xbits;
+	auto* xbits_hi_ptr = output.xbits_hi;
 	auto _src = static_cast<const uint8_t*>(src);
 	auto src_end = _src + len;
 	
@@ -406,7 +398,7 @@ static void lz77_encode(
 			auto next_data = _mm_cvtsi32_si128(*reinterpret_cast<const uint32_t*>(_src + sizeof(__m512i)));
 			
 			output.len += lz77_vec<true>(data, next_data, match_offsets, _src, 0, skip_next_bytes,
-				output.data + output.len, xbits_ptr, is_lendist_writer);
+				output.data + output.len, xbits_hi_ptr, is_lendist_writer);
 			cksum.update(data);
 			window_offset += sizeof(__m512i);
 		}
@@ -420,7 +412,7 @@ static void lz77_encode(
 				auto next_data = _mm_cvtsi32_si128(*reinterpret_cast<const uint32_t*>(_src + window_offset + sizeof(__m512i)));
 				
 				output.len += lz77_vec<false>(data, next_data, match_offsets, _src, window_offset, skip_next_bytes,
-					output.data + output.len, xbits_ptr, is_lendist_writer);
+					output.data + output.len, xbits_hi_ptr, is_lendist_writer);
 				cksum.update(data);
 			}
 			_src += window_offset;
@@ -465,9 +457,11 @@ static void lz77_encode(
 	
 	// write end-of-block and pad buffer using 0s (saves having to deal with masking during later stages)
 	_mm512_storeu_si512(output.data + output.len, ZEXT128_512(_mm_cvtsi32_si128(128)));
-	_mm512_storeu_si512(xbits_ptr, _mm512_setzero_si512());
+	_mm512_storeu_si512(xbits_hi_ptr, _mm512_setzero_si512());
 	is_lendist_writer.Write57(0xffffffff, 32);
 	is_lendist_writer.Write57(0xffffffff, 32);
+	
+	output.xbits_hi_len = xbits_hi_ptr - output.xbits_hi;
 	
 	src = _src;
 	output.len++;
