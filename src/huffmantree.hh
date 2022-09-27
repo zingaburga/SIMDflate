@@ -32,6 +32,20 @@ static HEDLEY_ALWAYS_INLINE void pack_bytes(__m512i in0, __m512i in1, __m512i& o
 }
 
 
+// alternatives to _mm*_mask_compressstoreu_epi* which doesn't massively slow down Zen4, due to `VPCOMPRESS* [mem]` being uCode
+// unlike the intrinsic, this does a full vector write instead of a masked one, but the caller should assume the contents of unmasked elements to be undefined (as we might optimise for Intel later by using the native intrinsic)
+// likely only marginally less efficient on Intel
+static HEDLEY_ALWAYS_INLINE void compress_store_512_8(void* dest, __mmask64 mask, __m512i data) {
+	_mm512_storeu_si512(dest, _mm512_maskz_compress_epi8(mask, data));
+}
+static HEDLEY_ALWAYS_INLINE void compress_store_256_8(void* dest, __mmask32 mask, __m256i data) {
+	_mm256_storeu_si256(static_cast<__m256i*>(dest), _mm256_maskz_compress_epi8(mask, data));
+}
+static HEDLEY_ALWAYS_INLINE void compress_store_512_16(void* dest, __mmask32 mask, __m512i data) {
+	_mm512_storeu_si512(dest, _mm512_maskz_compress_epi16(mask, data));
+}
+
+
 // pre-computed lookup table for {0, 1/1, 1/3, 1/7, 1/15 ...}
 constexpr uint32_t divide_gen(unsigned n) {
 	if(n == 0) return 0;
@@ -155,8 +169,8 @@ class HuffmanTree {
 		auto m128_191 = _kandn_mask64(m64, m128_255);
 		auto m0_63 = _mm512_mask_cmplt_epu8_mask(_knot_mask64(m256), data, _mm512_set1_epi8(64)); //_knot_mask64(_kor_mask64(_kor_mask64(m64, m128_255), m256));
 		
-		_mm512_mask_compressstoreu_epi8(store0_63, m0_63, idx);
-		_mm512_mask_compressstoreu_epi8(store64_127, m64_127, idx);
+		compress_store_512_8(store0_63, m0_63, idx);
+		compress_store_512_8(store64_127, m64_127, idx);
 		
 		 += _mm_popcnt_u64(_cvtmask64_u64(m0_63));
 		
@@ -285,12 +299,12 @@ class HuffmanTree {
 		auto split_round0 = [&](__m512i elems) {
 			auto lo_elems = _mm512_testn_epi8_mask(elems, test);
 			int loel_cnt = _mm_popcnt_u64(_cvtmask64_u64(lo_elems));
-			_mm512_mask_compressstoreu_epi8(idx_store + lo_pos, lo_elems, idx);
+			compress_store_512_8(idx_store + lo_pos, lo_elems, idx);
 			lo_pos += loel_cnt;
 			if(num_sym <= 64) {
-				_mm512_mask_compressstoreu_epi8(idx_store + loel_cnt, _knot_mask64(lo_elems), idx);
+				compress_store_512_8(idx_store + loel_cnt, _knot_mask64(lo_elems), idx);
 			} else {
-				_mm512_mask_compressstoreu_epi8(idx_store + hi_pos, _knot_mask64(lo_elems), idx);
+				compress_store_512_8(idx_store + hi_pos, _knot_mask64(lo_elems), idx);
 				hi_pos += 64 - loel_cnt;
 			}
 			idx = _mm512_add_epi8(idx, _mm512_set1_epi8(64));
@@ -302,8 +316,8 @@ class HuffmanTree {
 		if(num_sym > 256) {
 			auto lo_elems = _mm256_mask_testn_epi8_mask(LAST_MASK, sc4l, _mm512_castsi512_si256(test));
 			int loel_cnt = _mm_popcnt_u32(_cvtmask32_u32(lo_elems));
-			_mm256_mask_compressstoreu_epi8(idx_store + lo_pos, lo_elems, _mm512_castsi512_si256(idx));
-			_mm256_mask_compressstoreu_epi8(idx_store + hi_pos, _knot_mask32(lo_elems), _mm512_castsi512_si256(idx));
+			compress_store_256_8(idx_store + lo_pos, lo_elems, _mm512_castsi512_si256(idx));
+			compress_store_256_8(idx_store + hi_pos, _knot_mask32(lo_elems), _mm512_castsi512_si256(idx));
 			uint64_t lo_islen = _bzhi_u32(-1, loel_cnt) << (lo_pos & 7);
 			uint64_t hi_islen = _bzhi_u32(-1, 30-loel_cnt) << (hi_pos & 7);
 			memcpy(islen_store + (lo_pos>>3), &lo_islen, sizeof(lo_islen));
@@ -346,11 +360,11 @@ class HuffmanTree {
 				auto lo_elems = _mm512_testn_epi8_mask(elems, test);
 				uint64_t i_lo_elems = _cvtmask64_u64(lo_elems);
 				int loel_cnt = _mm_popcnt_u64(i_lo_elems);
-				_mm512_mask_compressstoreu_epi8(idx_store + lo_pos, lo_elems, idx);
+				compress_store_512_8(idx_store + lo_pos, lo_elems, idx);
 				if(num_sym <= 64)
-					_mm512_mask_compressstoreu_epi8(idx_store + loel_cnt, _knot_mask64(lo_elems), idx);
+					compress_store_512_8(idx_store + loel_cnt, _knot_mask64(lo_elems), idx);
 				else
-					_mm512_mask_compressstoreu_epi8(idx_store + hi_pos, _knot_mask64(lo_elems), idx);
+					compress_store_512_8(idx_store + hi_pos, _knot_mask64(lo_elems), idx);
 				if(num_sym > 256) {
 					uint64_t lo_islen = _pext_u64(islen, i_lo_elems);
 					uint64_t hi_islen = _pext_u64(islen, ~i_lo_elems);
@@ -375,8 +389,8 @@ class HuffmanTree {
 				auto lo_elems = _mm256_mask_testn_epi8_mask(LAST_MASK, elems, _mm512_castsi512_si256(test));
 				uint32_t i_lo_elems = _cvtmask32_u32(lo_elems);
 				int loel_cnt = _mm_popcnt_u32(i_lo_elems);
-				_mm256_mask_compressstoreu_epi8(idx_store + lo_pos, lo_elems, idx);
-				_mm256_mask_compressstoreu_epi8(idx_store + hi_pos, _knot_mask32(lo_elems), idx);
+				compress_store_256_8(idx_store + lo_pos, lo_elems, idx);
+				compress_store_256_8(idx_store + hi_pos, _knot_mask32(lo_elems), idx);
 				uint32_t lo_islen = _pext_u32(islen, i_lo_elems);
 				uint32_t hi_islen = _pext_u32(islen, ~i_lo_elems & I_LAST_MASK);
 				bit_write32flush(islen_store + (lo_pos>>3), lo_islen, loel_cnt, lo_byte, lo_pos&7);
@@ -549,11 +563,11 @@ class HuffmanTree {
 			for(int i=0; i<288; i+=32) {
 				auto data = _mm512_load_si512(sym_counts + i);
 				auto matched = i==256 ? _mm512_mask_cmpeq_epi16_mask(LAST_MASK, data, cmp) : _mm512_cmpeq_epi16_mask(data, cmp);
-				_mm512_mask_compressstoreu_epi16(sym_index + skipped_sym, matched, idx);
+				compress_store_512_16(sym_index + skipped_sym, matched, idx);
 				_mm512_storeu_si512(hist_sorted + skipped_sym, cmp);
 				auto not_matched = _knot_mask32(matched);
-				_mm512_mask_compressstoreu_epi16(sym_index_packed + i - skipped_sym, not_matched, idx);
-				_mm512_mask_compressstoreu_epi16(hist_packed + i - skipped_sym, not_matched, data);
+				compress_store_512_16(sym_index_packed + i - skipped_sym, not_matched, idx);
+				compress_store_512_16(hist_packed + i - skipped_sym, not_matched, data);
 				
 				skipped_sym += _mm_popcnt_u32(_cvtmask32_u32(matched));
 				idx = _mm512_add_epi16(idx, _mm512_set1_epi16(32));
@@ -1470,7 +1484,7 @@ public:
 			// compress down to final result
 			auto wanted_bytes = run_reduced_mask64 | ~runmask;
 			wanted_bytes &= loadmask;
-			_mm512_mask_compressstoreu_epi8(data_ptr, _cvtu64_mask64(wanted_bytes), vlen);
+			compress_store_512_8(data_ptr, _cvtu64_mask64(wanted_bytes), vlen);
 			data_ptr += _mm_popcnt_u64(wanted_bytes);
 		});
 		
