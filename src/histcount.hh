@@ -9,6 +9,8 @@ bool symbol_histogram(uint16_t* sym_counts, const Lz77Data& lz77output) {
 	// additional histogram bin; used to reduce dependency chain on having only one bin
 	alignas(64) uint16_t count_xbin[NUM_SYM_TOTAL] = {};
 	bool is_sample = false; // TODO: determine if sampling
+	// WARNING: enabling sampling currently allows exceeding the max deflate length; may be possible to enable it by changing the max length calculation to include a buffer or similar at the end?
+	
 	// if we're taking only a sample, we can't exclude any symbols, so need to set minimum count of all to 1
 	auto count_fill = is_sample ? _mm512_set1_epi16(1) : _mm512_setzero_si512();
 	for(unsigned i=0; i<NUM_SYM_TOTAL; i+=32) {

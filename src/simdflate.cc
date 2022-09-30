@@ -19,6 +19,75 @@ const int SIMDFLATE_COMPILER_SUPPORTED = 1;
 #include "histcount.hh"
 #include "huffmanenc.hh"
 
+// length of a raw (uncompressed) DEFLATE block
+static inline unsigned raw_block_len(size_t src_len, int output_bitpos) {
+	assert(src_len > 0);
+	assert(output_bitpos >= 0 && output_bitpos < 8);
+	
+	unsigned raw_len = (8 - (output_bitpos + 3)) & 7; // bits reserved for padding
+	size_t cur_block_len = std::min(src_len, size_t(65535));
+	raw_len += 32 + cur_block_len*8;
+	src_len -= cur_block_len;
+	// add size of remaining blocks
+	raw_len += 40*(src_len/65535) + src_len*8;
+	return raw_len;
+}
+
+static void calc_huffman_len(const HuffmanTree<286, 15>& huf_litlen, const HuffmanTree<30, 15>& huf_dist, const uint16_t* sym_counts, unsigned& dyn_size, unsigned& fixed_size) {
+	assert(sym_counts[286] == 0 && sym_counts[287] == 0 && sym_counts[318] == 0 && sym_counts[319] == 0);
+	
+	// compute size of dynamic and fixed Huffman blocks
+	__m512i dyn_lo, dyn_hi, fixed_lo, fixed_hi;
+	dyn_lo = dyn_hi = fixed_lo = fixed_hi = _mm512_setzero_si512();
+	auto accumulate = [&](int i, const uint8_t* huf_len, __m512i fixed_len, __m512i xbits_len) {
+		auto hist = _mm512_load_si512(sym_counts + i);
+		auto dyn_len = _mm512_cvtepu8_epi16(_mm256_load_si256(reinterpret_cast<const __m256i*>(huf_len)));
+		
+		// add in extra bits
+		fixed_len = _mm512_add_epi16(fixed_len, xbits_len);
+		dyn_len = _mm512_add_epi16(dyn_len, xbits_len);
+		
+		// split the sign bit off to workaround the lack of an unsigned multiply
+		auto hist_lo = _mm512_and_si512(hist, _mm512_set1_epi16(0x7fff));
+		auto hist_hi = _mm512_srli_epi16(hist, 15);
+		
+		dyn_lo = _mm512_dpwssd_epi32(dyn_lo, hist_lo, dyn_len);
+		dyn_hi = _mm512_dpwssd_epi32(dyn_hi, hist_hi, dyn_len);
+		fixed_lo = _mm512_dpwssd_epi32(fixed_lo, hist_lo, fixed_len);
+		fixed_hi = _mm512_dpwssd_epi32(fixed_hi, hist_hi, fixed_len);
+	};
+	accumulate(  0, huf_litlen.lengths +   0, _mm512_set1_epi16(8), _mm512_setzero_si512());
+	accumulate( 32, huf_litlen.lengths +  32, _mm512_set1_epi16(8), _mm512_setzero_si512());
+	accumulate( 64, huf_litlen.lengths +  64, _mm512_set1_epi16(8), _mm512_setzero_si512());
+	accumulate( 96, huf_litlen.lengths +  96, _mm512_set1_epi16(8), _mm512_setzero_si512());
+	accumulate(128, huf_litlen.lengths + 128, VEC512_16(8 + _x/16), _mm512_setzero_si512());
+	accumulate(160, huf_litlen.lengths + 160, _mm512_set1_epi16(9), _mm512_setzero_si512());
+	accumulate(192, huf_litlen.lengths + 192, _mm512_set1_epi16(9), _mm512_setzero_si512());
+	accumulate(224, huf_litlen.lengths + 224, _mm512_set1_epi16(9), _mm512_setzero_si512());
+	const auto XBITS_LEN = huffman_lendist_xbits_len();
+	accumulate(256, huf_litlen.lengths + 256, VEC512_16(_x >= 24 ? 8 : 7), _mm512_cvtepu8_epi16(_mm512_castsi512_si256(XBITS_LEN)));
+	accumulate(288, huf_dist.lengths, _mm512_set1_epi16(5), _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(XBITS_LEN, 1)));
+
+	// merge lo/hi halves
+	dyn_lo = _mm512_add_epi32(dyn_lo, _mm512_slli_epi32(dyn_hi, 15));
+	fixed_lo = _mm512_add_epi32(fixed_lo, _mm512_slli_epi32(fixed_hi, 15));
+	
+	// horizontal sum down
+	auto huff_size = _mm512_add_epi32(
+		_mm512_unpacklo_epi32(dyn_lo, fixed_lo),
+		_mm512_unpackhi_epi32(dyn_lo, fixed_lo)
+	);
+	auto huff256 = _mm256_add_epi32(_mm512_castsi512_si256(huff_size), _mm512_extracti64x4_epi64(huff_size, 1));
+	auto huff128 = _mm_add_epi32(_mm256_castsi256_si128(huff256), _mm256_extracti128_si256(huff256, 1));
+	huff128 = _mm_add_epi32(huff128, _mm_unpackhi_epi64(huff128, huff128));
+	
+	dyn_size = _mm_cvtsi128_si32(huff128);
+	fixed_size = _mm_extract_epi32(huff128, 1);
+	
+	// TODO: without the header, dynamic Huffman should almost never be larger than fixed Huffman (if package-merge is used, this should definitely be the case)
+	assert(dyn_size > 0);
+	assert(fixed_size > 0);
+}
 
 // write the dynamic Huffman block header [https://www.w3.org/Graphics/PNG/RFC-1951#dyn]
 static void write_dyn_block_header(BitWriter& output, const HuffmanTree<286, 15>& huf_litlen, const HuffmanTree<30, 15>& huf_dist, bool is_last_block) {
@@ -47,12 +116,11 @@ static void write_dyn_block_header(BitWriter& output, const HuffmanTree<286, 15>
 	
 	// strip zeroes from codelen
 	auto nonzero_len = _cvtmask32_u32(_mm256_test_epi8_mask(codelen_lengths, codelen_lengths));
-	nonzero_len |= 0b1000; // minimum length is 4
 	int num_codelen = 32 - _lzcnt_u32(nonzero_len);
+	assert(num_codelen >= 5); // minimum possible length requires at least one litlen/distance length
 	
 	assert(num_litlen >= 257);
 	assert(num_dist >= 1);
-	assert(num_codelen >= 4);
 	
 	// write the first part of the header
 	output.ZeroWrite57(
@@ -131,50 +199,26 @@ static void write_dyn_block_header(BitWriter& output, const HuffmanTree<286, 15>
 	});
 }
 
+static inline void write_fixed_block_header(BitWriter& output, bool is_last_block) {
+	output.ZeroWrite57(2 + (is_last_block ? 1:0), 3);
+}
+static inline void write_raw_block_header(BitWriter& output, uint16_t len, bool is_last_block) {
+	output.ZeroWrite57(is_last_block ? 1:0, 3);
+	output.PadToByte();
+	output.ZeroWrite57(uint32_t(len | (~len << 16)), 32);
+}
+
 template<class ChecksumClass>
 static size_t deflate_main(void* HEDLEY_RESTRICT dest, const void* HEDLEY_RESTRICT src, size_t len, ChecksumClass& cksum) {
-	// don't bother compressing short messages
-	if(len < 64) { // TODO: adjust threshold for no compression, don't allow it to be larger than 256 though
-		if(len == 0) {
-			// write blank header
-			const uint16_t BLANK_HEADER = 
-				1  // last block [1]
-				| (1 << 1) // static Huffman [2]
-				| (0 << 3) // symbol 256 (end of block) [7]
-			;
-			memcpy(dest, &BLANK_HEADER, 2);
-			return 2;
-		}
-		assert(len < 65536); // size limit of uncompressed block
-		uint64_t header = 
+	if(len == 0) {
+		// write blank header
+		const uint16_t BLANK_HEADER = 
 			1  // last block [1]
-			| (0 << 1)   // no compression [2]
-			// 5 bits of padding, to byte align
-			| (len << 8) // length
-			| ((~len) << 24) // NLEN
-		; // 40 bits total
-		memcpy(dest, &header, 5);
-		
-		auto dest_ = static_cast<uint8_t*>(dest) + 5;
-		auto src_ = static_cast<const uint8_t*>(src);
-		
-		size_t pos = 0;
-		for(; pos + sizeof(__m512i) <= len; pos += sizeof(__m512i)) {
-			auto data = _mm512_loadu_si512(src_ + pos);
-			cksum.update(data);
-			_mm512_storeu_si512(dest_ + pos, data);
-		}
-		
-		if(pos < len) { // final vector
-			auto loadmask = _bzhi_u64(-1LL, len-pos);
-			auto data = _mm512_maskz_loadu_epi8(_cvtu64_mask64(loadmask), src_ + pos);
-			cksum.update_partial(data, len-pos);
-			
-			auto storemask = (loadmask + 1) | loadmask; // set an extra mask bit for the trailing 3 bits
-			_mm512_mask_storeu_epi8(dest_ + pos, _cvtu64_mask64(storemask), data);
-		}
-		
-		return 5 + len;
+			| (1 << 1) // static Huffman [2]
+			| (0 << 3) // symbol 256 (end of block) [7]
+		;
+		memcpy(dest, &BLANK_HEADER, 2);
+		return 2;
 	}
 	
 	BitWriter output(dest);
@@ -183,10 +227,37 @@ static size_t deflate_main(void* HEDLEY_RESTRICT dest, const void* HEDLEY_RESTRI
 	bool first_block = true;
 	uint16_t window_offset = 0;
 	unsigned skip_next_bytes = 0;
-	while(len) {
+	auto remaining_len = len;
+	while(remaining_len) {
+		auto start_src = static_cast<const uint8_t*>(src);
+		if(HEDLEY_UNLIKELY(remaining_len < 64)) { // no point in trying to compress really small messages
+			if(remaining_len < 32) { // TODO: adjust threshold?
+				// for length < 25, fixed Huffman is guaranteed to be more efficient over raw - this is because the raw header has a minimum 32 bit header, whilst fixed Huffman has a minimum 7 bit end-of-block symbol.
+				write_fixed_block_header(output, true);
+				
+				auto mask = _cvtu64_mask64(_bzhi_u64(-1LL, remaining_len));
+				auto data = _mm512_maskz_loadu_epi8(mask, src);
+				huffman_fixed_encode_literals(output, data, mask);
+				cksum.update_partial(data, remaining_len);
+				output.ZeroWrite57(0, 7); // end-of-block
+			} else {
+				write_raw_block_header(output, remaining_len, true);
+				auto dest_ = static_cast<uint8_t*>(output.Ptr());
+				loop_u8x64(remaining_len, start_src, _mm512_setzero_si512(), [&](__m512i data, size_t pos) {
+					cksum.update(data);
+					_mm512_storeu_si512(dest_ + pos, data);
+				}, [&](__m512i data, __mmask64 mask, size_t pos, size_t data_len) {
+					cksum.update_partial(data, data_len);
+					_mm512_mask_storeu_epi8(dest_ + pos, mask, data);
+				});
+				output.SkipBytes(remaining_len);
+			}
+			break;
+		}
+		
 		// LZ77 encode data
 		alignas(64) Lz77Data lz77data;
-		lz77_encode(lz77data, src, len, window_offset, skip_next_bytes, match_offsets.data(), first_block, cksum);
+		lz77_encode(lz77data, src, remaining_len, window_offset, skip_next_bytes, match_offsets.data(), first_block, cksum);
 		
 		// histogram LZ77 output
 		// TODO: consider idea of doing symbol count before lz77, and using the information to assist lz77 in using a match or not?
@@ -198,19 +269,79 @@ static size_t deflate_main(void* HEDLEY_RESTRICT dest, const void* HEDLEY_RESTRI
 		alignas(64) HuffmanTree<286, 15> huf_litlen(sym_counts, is_sample);
 		alignas(64) HuffmanTree<30, 15> huf_dist(sym_counts + 288, is_sample);
 		
-		// write block header
-		write_dyn_block_header(output, huf_litlen, huf_dist, len==0);
-		// TODO: compute size of uncompressed block, and if above block is larger, rewrite it as an uncompressed block?
-		// - if sampling symbol counts, can only do the check after Huffman encoding
+		auto pre_header_pos = output.BitLength(dest);
+		write_dyn_block_header(output, huf_litlen, huf_dist, remaining_len==0);
+		unsigned dyn_header_len = output.BitLength(dest) - pre_header_pos;
+		assert(dyn_header_len >= 3 /*block header*/ +5+5+4 /*lengths*/ + 5*3 /*min 5 length symbols*/ + 2*(1+7)+1 /*257x litlen codelengths as 2x sym18 + sym8*/ +1 /*1x distance codelength*/);
+		// i.e. min length of 50 bits (realistically not possible though, since one symbol isn't going to be encoded at 8 bits, and there's an end-of-block symbol to consider)
 		
-		// encode data to output
-		huffman_encode(output, huf_litlen, huf_dist, lz77data);
+		
+		size_t src_block_size = static_cast<const uint8_t*>(src) - start_src;
+		unsigned raw_block_size = raw_block_len(src_block_size, pre_header_pos & 7);
+		bool write_raw_data = false;
+		if(is_sample) {
+			// write a dynamic Huffman block, then compare it with the raw block size
+			// note, this does mean that the following write could exceed the write buffer, if sized according to the maximum!
+			huffman_dyn_encode(output, huf_litlen, huf_dist, lz77data);
+			
+			unsigned cur_block_size = output.BitLength(dest) - pre_header_pos;
+			
+			if(HEDLEY_UNLIKELY(raw_block_size < cur_block_size)) {
+				output.Rewind(cur_block_size);
+				write_raw_data = true;
+			}
+		} else {
+			unsigned dyn_block_size, fixed_block_size;
+			calc_huffman_len(huf_litlen, huf_dist, sym_counts, dyn_block_size, fixed_block_size);
+			
+#ifndef NDEBUG
+			{ // verify calculated sizes are correct
+				std::vector<uint8_t> test_buf(src_block_size*2 + sizeof(__m512i));
+				BitWriter test_out(test_buf.data());
+				huffman_dyn_encode(test_out, huf_litlen, huf_dist, lz77data);
+				unsigned actual_size = test_out.BitLength(test_buf.data());
+				assert(actual_size == dyn_block_size);
+				
+				test_out.Rewind(dyn_block_size);
+				assert(test_out.BitLength(test_buf.data()) == 0);
+				huffman_fixed_encode(test_out, lz77data);
+				actual_size = test_out.BitLength(test_buf.data());
+				assert(actual_size == fixed_block_size);
+			}
+#endif
+			
+			dyn_block_size += dyn_header_len - 3; // add in header, except for 3-bit block header
+			
+			if(HEDLEY_LIKELY(dyn_block_size < fixed_block_size && dyn_block_size < raw_block_size)) {
+				huffman_dyn_encode(output, huf_litlen, huf_dist, lz77data);
+			} else if(fixed_block_size < raw_block_size) {
+				output.Rewind(dyn_header_len);
+				write_fixed_block_header(output, remaining_len==0);
+				huffman_fixed_encode(output, lz77data);
+			} else {
+				output.Rewind(dyn_header_len);
+				write_raw_data = true;
+			}
+		}
+		
+		if(HEDLEY_UNLIKELY(write_raw_data)) {
+			while(src_block_size) {
+				auto cur_block_size = std::min(src_block_size, size_t(65535));
+				src_block_size -= cur_block_size;
+				write_raw_block_header(output, cur_block_size, remaining_len==0 && src_block_size==0);
+				memcpy(output.Ptr(), start_src, cur_block_size);
+				output.SkipBytes(cur_block_size);
+				start_src += cur_block_size;
+			}
+		}
 		
 		// proceed to next block
 		first_block = false;
 	}
 	
-	return output.Length(dest);
+	auto total_size = output.Length(dest);
+	assert(total_size + sizeof(__m512i) <= simdflate_max_deflate_len(len));
+	return total_size;
 }
 
 
@@ -273,6 +404,7 @@ size_t simdflate_gzip(void* dest, const void* src, size_t len) {
 	return out_len + 18;
 }
 
+
 #else
 
 const int SIMDFLATE_COMPILER_SUPPORTED = 0;
@@ -287,3 +419,15 @@ size_t simdflate_zlib(void*, const void*, size_t) { return 0; }
 size_t simdflate_gzip(void*, const void*, size_t) { return 0; }
 
 #endif
+
+size_t simdflate_max_deflate_len(size_t len) {
+	// the output buffer size is guaranteed to hold at least that many input bytes
+	size_t max_blocks = (len+OUTPUT_BUFFER_SIZE-1) / OUTPUT_BUFFER_SIZE;
+	
+	// maximum possible length occurs when all blocks are uncompressed
+	// uncompressed blocks are at most 65535 bytes long, and have a 5 byte header
+	// our block splitting strategy is a little inefficient, such that an extra block could be created per OUTPUT_BUFFER_SIZE sized block
+	// also add a vector's worth of bytes for padding purposes
+	return len + (len/65535)*5 + max_blocks*5 + sizeof(__m512i);
+}
+

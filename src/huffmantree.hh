@@ -85,7 +85,7 @@ class HuffmanTree {
 		uint64_t expmask = ~0ULL << _mm_popcnt_u64(_cvtmask64_u64(lo_elems));
 		return _mm512_mask_expand_epi8(lo, _cvtu64_mask64(expmask), hi);
 		*/
-		auto shift_idx = _mm512_set1_epi8(_mm_popcnt_u64(_cvtmask64_u64((lo_elems))));
+		auto shift_idx = _mm512_set1_epi8(_mm_popcnt_u64(_cvtmask64_u64(lo_elems)));
 		shift_idx = _mm512_sub_epi8(VEC512_8(_x), shift_idx);
 		hi = _mm512_permutexvar_epi8(shift_idx, hi);
 		return _mm512_mask_compress_epi8(hi, lo_elems, data);
@@ -97,7 +97,7 @@ class HuffmanTree {
 		uint32_t expmask = ~0U << _mm_popcnt_u32(_cvtmask32_u32(lo_elems));
 		return _mm512_mask_expand_epi16(lo, _cvtu32_mask32(expmask), hi);
 		*/
-		auto shift_idx = _mm512_set1_epi16(_mm_popcnt_u32(_cvtmask32_u32((lo_elems))));
+		auto shift_idx = _mm512_set1_epi16(_mm_popcnt_u32(_cvtmask32_u32(lo_elems)));
 		shift_idx = _mm512_sub_epi16(VEC512_16(_x), shift_idx);
 		hi = _mm512_permutexvar_epi16(shift_idx, hi);
 		return _mm512_mask_compress_epi16(hi, lo_elems, data);

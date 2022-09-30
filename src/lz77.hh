@@ -386,6 +386,7 @@ static void lz77_encode(
 	auto src_end = _src + len;
 	
 	assert((window_offset & (sizeof(__m512i)-1)) == 0);
+	assert(output.len == 0);
 	
 	if(len > sizeof(__m512i)*2) {
 		_src -= window_offset;
@@ -421,7 +422,8 @@ static void lz77_encode(
 			
 			if(output.len >= OUTPUT_BUFFER_SIZE - sizeof(__m512i)*2) break;
 		}
-	}
+	} else assert(len > 0);
+	HEDLEY_STATIC_ASSERT(OUTPUT_BUFFER_SIZE > sizeof(__m512i)*2, "Output buffer must be large enough to hold at least two vectors");
 	unsigned end_misalign = src_end - _src;
 	if(end_misalign && output.len < OUTPUT_BUFFER_SIZE - sizeof(__m512i)*2) {
 		// for now, just write the last part as literals; TODO: do LZ77 on the last part

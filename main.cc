@@ -34,8 +34,7 @@ int main(int argc, char** argv) {
 	}
 	fclose(f);
 	
-	// TODO: size output appropriately
-	std::vector<unsigned char> output(data.size()*2 + 64);
+	std::vector<unsigned char> output(simdflate_max_gzip_len(data.size()));
 	
 	auto start = std::chrono::high_resolution_clock::now();
 	auto output_len = simdflate_gzip(output.data(), data.data(), data.size());

@@ -104,11 +104,26 @@ public:
 	inline void SkipBytes(unsigned len) {
 		output += len;
 	}
+	inline void Rewind(unsigned len) { // warning: doesn't zero fill!
+		int new_bitpos = int(bitpos) - len;
+		output += new_bitpos >> 3;
+		bitpos = new_bitpos & 7;
+	}
+	inline void* Ptr() const {
+		return output;
+	}
+	inline void PadToByte() {
+		output += (bitpos > 0);
+		bitpos = 0;
+	}
 	inline size_t Length(const void* start) const {
 		return size_t(output - static_cast<const uint8_t*>(start) + (bitpos > 0));
 	}
 	inline uint64_t BitLength(const void* start) const {
 		return uint64_t(output - static_cast<const uint8_t*>(start)) * 8 + bitpos;
+	}
+	inline unsigned BitOffset() const {
+		return bitpos;
 	}
 };
 

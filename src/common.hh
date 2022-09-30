@@ -28,6 +28,7 @@ const size_t MATCH_TABLE_ORDER = 12;
 const size_t WINDOW_ORDER = 14; // = 16KB; max LZ77 window is 32KB (order=15)
 // size of LZ77 output buffer; once this is filled, a block will be written
 // note that histogramming uses 2x16-bit counters, meaning this value can't exceed 128KB (until sampling is introduced), but it's recommended to not exceed 64KB too much (reduced sampling accuracy due to using 16-bit counters)
+// should also be larger than 128 bytes
 const size_t OUTPUT_BUFFER_SIZE = 64*1024;
 
 
@@ -83,17 +84,25 @@ static HEDLEY_ALWAYS_INLINE __m512i make_vec512_epi16(fn&& f) {
 
 
 // shortcut for looping over an array using 512-bit vectors, masking appropriately for the tail
-template<typename fn>
-static HEDLEY_ALWAYS_INLINE void loop_u8x64(size_t size, const void* data, __m512i invalid_data, fn&& f) {
+template<typename fn_main, typename fn_end>
+static HEDLEY_ALWAYS_INLINE void loop_u8x64(size_t size, const void* data, __m512i invalid_data, fn_main&& fm, fn_end&& fe) {
 	auto data_ = static_cast<const uint8_t*>(data);
 	size_t i = 0;
 	for(; i+sizeof(__m512i)<=size; i+=sizeof(__m512i)) {
-		f(_mm512_loadu_si512(data_ + i), -1LL, i);
+		fm(_mm512_loadu_si512(data_ + i), i);
 	}
 	if(size - i) { // tail vector
 		uint64_t mask = _bzhi_u64(-1LL, size - i);
-		f(_mm512_mask_loadu_epi8(invalid_data, _cvtu64_mask64(mask), data_ + i), mask, i);
+		fe(_mm512_mask_loadu_epi8(invalid_data, _cvtu64_mask64(mask), data_ + i), mask, i, size - i);
 	}
+}
+template<typename fn>
+static HEDLEY_ALWAYS_INLINE void loop_u8x64(size_t size, const void* data, __m512i invalid_data, fn&& f) {
+	loop_u8x64(size, data, invalid_data, [&f](__m512i vdata, size_t& i) {
+		f(vdata, _cvtu64_mask64(-1LL), i);
+	}, [&f](__m512i vdata, __mmask64 mask, size_t& i, size_t len) {
+		f(vdata, mask, i);
+	});
 }
 template<typename fn>
 static HEDLEY_ALWAYS_INLINE void loop_u8x64(size_t size, const void* data, fn&& f) {
