@@ -19,7 +19,7 @@ const int SIMDFLATE_COMPILER_SUPPORTED = 1;
 #include "histcount.hh"
 #include "huffmanenc.hh"
 
-// length of a raw (uncompressed) DEFLATE block
+// length of a raw (uncompressed) DEFLATE block(s)
 static inline unsigned raw_block_len(size_t src_len, int output_bitpos) {
 	assert(src_len > 0);
 	assert(output_bitpos >= 0 && output_bitpos < 8);
@@ -33,10 +33,10 @@ static inline unsigned raw_block_len(size_t src_len, int output_bitpos) {
 	return raw_len;
 }
 
+// compute length of a dynamic + fixed Huffman block, based on symbol histogram
 static void calc_huffman_len(const HuffmanTree<286, 15>& huf_litlen, const HuffmanTree<30, 15>& huf_dist, const uint16_t* sym_counts, unsigned& dyn_size, unsigned& fixed_size) {
 	assert(sym_counts[286] == 0 && sym_counts[287] == 0 && sym_counts[318] == 0 && sym_counts[319] == 0);
 	
-	// compute size of dynamic and fixed Huffman blocks
 	__m512i dyn_lo, dyn_hi, fixed_lo, fixed_hi;
 	dyn_lo = dyn_hi = fixed_lo = fixed_hi = _mm512_setzero_si512();
 	auto accumulate = [&](int i, const uint8_t* huf_len, __m512i fixed_len, __m512i xbits_len) {
@@ -199,6 +199,7 @@ static void write_dyn_block_header(BitWriter& output, const HuffmanTree<286, 15>
 	});
 }
 
+// write headers for fixed Huffman or raw (uncompressed) blocks
 static inline void write_fixed_block_header(BitWriter& output, bool is_last_block) {
 	output.ZeroWrite57(2 + (is_last_block ? 1:0), 3);
 }

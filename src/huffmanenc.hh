@@ -392,6 +392,7 @@ static void huffman_fixed_encode(BitWriter& output, const Lz77Data& lz77output) 
 	}
 }
 
+// Encode <= 64 bytes using fixed Huffman
 static void huffman_fixed_encode_literals(BitWriter& output, __m512i data, __mmask64 valid_mask) {
 	auto nine_bit_syms = _mm512_cmpge_epu8_mask(data, _mm512_set1_epi8(144));
 	auto eight = _mm512_maskz_set1_epi8(valid_mask, 8);

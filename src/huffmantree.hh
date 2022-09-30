@@ -144,40 +144,6 @@ class HuffmanTree {
 		si = _mm512_mask_rol_epi32(si, swap, si, 16);
 		return si;
 	}
-	/*
-	static HEDLEY_ALWAYS_INLINE __m512i sort_idx64(__m512i key, __m512i idx) {
-		auto test = _mm512_set1_epi8(2);
-		idx = splicehalf_i8(idx, _mm512_testn_epi16_mask(key, test));
-		for(int i=2; i<6; i++) {
-			test = _mm512_add_epi8(test, test);
-			idx = splicehalf_i8(idx, _mm512_testn_epi16_mask(_mm512_permutexvar_epi8(idx, key), test));
-		}
-		auto swap = _mm512_test_epi16_mask(_mm512_permutexvar_epi8(idx, key), _mm512_set1_epi16(1));
-		idx = _mm512_mask_shldi_epi16(idx, swap, idx, idx, 8);
-		return idx;
-	}
-	static HEDLEY_ALWAYS_INLINE void sort_hi288(__m512i si) {
-		// split into groups of 64
-		
-		data;
-		// move >256 out
-		
-		auto m128_255 = _mm512_movm_epi8(data);
-		auto m64 = _mm512_test_epi8_mask(data, _mm512_set1_epi8(64));
-		auto m192_255 = _kand_mask64(m64, m128_255);
-		auto m64_127 = _kandn_mask64(m128_255, m64);
-		auto m128_191 = _kandn_mask64(m64, m128_255);
-		auto m0_63 = _mm512_mask_cmplt_epu8_mask(_knot_mask64(m256), data, _mm512_set1_epi8(64)); //_knot_mask64(_kor_mask64(_kor_mask64(m64, m128_255), m256));
-		
-		compress_store_512_8(store0_63, m0_63, idx);
-		compress_store_512_8(store64_127, m64_127, idx);
-		
-		 += _mm_popcnt_u64(_cvtmask64_u64(m0_63));
-		
-		// sort each vector
-		
-	}
-	*/
 	
 	/// Bit writing helpers
 	static HEDLEY_ALWAYS_INLINE void bit_write64(void* output, uint64_t data, int len, uint_fast8_t& byte, int bits) {
@@ -853,28 +819,6 @@ class HuffmanTree {
 		auto nodes_to_move = kraft_total & ((1 << max_length) -1);
 		histNumBits[max_length] -= nodes_to_move;
 		
-		
-		/*
-		TODO: try to do some vectorizing?
-		mul nodes by 1,3,7,15...
-		prefix sum
-		compare num to move to find cutoff point
-		subtract cutoff from nodes_to_move
-		at cutoff point, figure how many nodes to drop
-		adjust nodes:
-			zero node counts before cutoff (except max)
-			add to max?
-		
-		instead of moving to max, can just move one level down
-			uses ceil_div
-			if mod3:
-				@9=> move 3 down(+6 lower), move 6 down to max
-				@10=>move 4 down(+8 lower), move 6 down to max
-			if mod7:
-				@9=> move 2 down(+4 lower), move 3 down(+6 lower), move 4 to max
-				@4=> move 1 down(+2 lower), move 1 down(+2 lower), move 2 to max
-		*/
-		
 		// TODO: this code needs to be tested more
 		for(unsigned i = max_length - 1; i > 0; i--)
 			if(HEDLEY_LIKELY(histNumBits[i] > 0)) {
@@ -1076,26 +1020,6 @@ public:
 				auto bl = _mm256_maskz_expandloadu_epi8(_cvtu32_mask32(-1 << skipped_sym), bit_lengths);
 				auto si = _mm512_mask_loadu_epi16(INDICES_I16, _cvtu32_mask32((1U << size) - 1), sym_index);
 				si = _mm512_or_si512(_mm512_slli_epi16(si, 8), _mm512_cvtepu8_epi16(bl));
-				*/
-				
-				
-				/* TODO: if sym_index is 8-bit, can combine differently, e.g.
-				auto si = _mm512_mask_expandloadu_epi8(
-					_mm512_set_epi32(
-						0x1f1e1d1c, 0x1b1a1918, 0x17161514, 0x13121110,
-						0x0f0e0d0c, 0x0b0a0908, 0x07060504, 0x03020100,
-						0, 0, 0, 0, 0, 0, 0, 0
-					),
-					_cvtu64_mask64(-1 << skipped_sym),
-					bit_lengths
-				);
-				si = _mm512_mask_loadu_epi8(si, _cvtu64_mask64(((1U << size) - 1) << 32), sym_index - 32);
-				si = _mm512_permutexvar_epi8(_mm512_set_epi32(
-					0x3f1f3e1e, 0x3d1d3c1c, 0x3b1b3a1a, 0x39193818,
-					0x37173616, 0x35153414, 0x33133212, 0x31113010,
-					0x2f0f2e0e, 0x2d0d2c0c, 0x2b0b2a0a, 0x29092808,
-					0x27072606, 0x25052404, 0x23032202, 0x21012000
-				), si);
 				*/
 				
 				si = sort_hi32(si);

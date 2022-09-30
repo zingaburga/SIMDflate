@@ -9,14 +9,6 @@ const size_t NICE_MATCH_LEN = 64; // max 64
 
 
 
-/* constexpr uint64_t bitset_gen(unsigned n) {
-	if(n == 0) return 0;
-	uint64_t bits = 1;
-	for (unsigned i = 1; i < n; i++) {
-		bits |= 1ULL << ((64*2 * i + n) / (n*2));
-	}
-	return bits;
-} */
 constexpr uint64_t bitdep_gen(unsigned bits_to_set, unsigned bits_available) {
 	uint64_t bits = 0;
 	for (unsigned i = 0; i < bits_to_set; i++) {
