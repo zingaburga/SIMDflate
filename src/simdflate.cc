@@ -360,7 +360,7 @@ size_t simdflate_zlib(void* dest, const void* src, size_t len) {
 	
 	uint16_t header = 
 		8 // CM = deflate
-		| ((WINDOW_ORDER-8) << 4) // CINFO
+		| ((WINDOW_ORDER < 8 ? 0 : WINDOW_ORDER-8) << 4) // CINFO
 		| (0 << 13) // no preset dictionary
 		| (0 << 14) // FLEVEL = 'fastest' compression level used
 	;

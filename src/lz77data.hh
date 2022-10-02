@@ -43,7 +43,9 @@ struct Lz77Data {
 	// add padding onto the end of these, to not have to worry about masking when reading the data
 	alignas(8)  uint64_t is_lendist[(OUTPUT_BUFFER_SIZE+63)/64 + 1];
 	alignas(64) uint8_t data[OUTPUT_BUFFER_SIZE + sizeof(__m512i)];
+#if WINDOW_ORDER > 9
 	alignas(64) uint8_t xbits_hi[LZ77DATA_XBITS_HI_SIZE];
+#endif
 	
 	inline Lz77Data() {
 		// is_lendist is written to using BitWriter, so needs to be zeroed up front

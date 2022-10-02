@@ -187,6 +187,7 @@ static void huffman_join_write(BitWriter& output, __m512i codelen, __m512i codel
 	}
 }
 
+#if WINDOW_ORDER > 9
 static void huffman_rotate_xbits_hi(uint8_t* HEDLEY_RESTRICT xbits_hi_tmp, const Lz77Data& lz77output) {
 	for(int i=0; i<lz77output.xbits_hi_len; i+=sizeof(__m512i)) {
 		auto data = _mm512_load_si512(lz77output.xbits_hi + i);
@@ -198,6 +199,7 @@ static void huffman_rotate_xbits_hi(uint8_t* HEDLEY_RESTRICT xbits_hi_tmp, const
 		_mm512_store_si512(xbits_hi_tmp + i, data);
 	}
 }
+#endif
 
 // dynamic Huffman encode
 static void huffman_dyn_encode(
@@ -216,11 +218,14 @@ static void huffman_dyn_encode(
 		1
 	);
 	
+#if WINDOW_ORDER > 9
 	// need to do a bit-rotate on lz77output.xbits_hi to make the main-loop code simpler
 	// the number of bytes in lz77output.xbits_hi is expected to be low, so doesn't make sense to try doing this in-loop
 	// it may make more sense to just overwrite lz77output.xbits_hi, but we'll retain its immutability for now
 	alignas(64) uint8_t xbits_hi_tmp[LZ77DATA_XBITS_HI_SIZE];
 	huffman_rotate_xbits_hi(xbits_hi_tmp, lz77output);
+	auto xbits_ptr = xbits_hi_tmp;
+#endif
 	
 	// compute Huffman codes
 	alignas(64) uint16_t litlen_codes[286 +2];
@@ -259,7 +264,6 @@ static void huffman_dyn_encode(
 		xsymlo, xsymhi
 	);
 	
-	auto xbits_ptr = xbits_hi_tmp;
 	auto last_data = _mm512_setzero_si512();
 	for(unsigned srcpos=0; srcpos<lz77output.len; srcpos+=sizeof(__m512i)) { // overflow is not a problem, because the buffer is 0 padded
 		auto data = _mm512_load_si512(lz77output.data + srcpos);
@@ -292,6 +296,7 @@ static void huffman_dyn_encode(
 		
 		// blend in length/distance extra bits into codelo
 		codelo = _mm512_mask_mov_epi8(codelo, m_xbits, data);
+#if WINDOW_ORDER > 9
 		// insert high extra bits into codehi
 		auto has_hi_xbits = _mm512_mask_test_epi8_mask(m_xbits, codelen, _mm512_set1_epi8(8));
 		codehi = _mm512_mask_expandloadu_epi8(codehi, has_hi_xbits, xbits_ptr);
@@ -301,6 +306,7 @@ static void huffman_dyn_encode(
 		const auto VALID_CODEHI_BITS = _mm512_set1_epi8(127);
 		codelo = _mm512_ternarylogic_epi64(codelo, codehi, VALID_CODEHI_BITS, 0xf4); // A | (B & ~C)
 		codehi = _mm512_and_si512(codehi, VALID_CODEHI_BITS);
+#endif
 		
 		huffman_join_write(output, codelen, codelo, codehi);
 	}
@@ -308,10 +314,12 @@ static void huffman_dyn_encode(
 
 
 static void huffman_fixed_encode(BitWriter& output, const Lz77Data& lz77output) {
+#if WINDOW_ORDER > 9
 	alignas(64) uint8_t xbits_hi_tmp[LZ77DATA_XBITS_HI_SIZE];
 	huffman_rotate_xbits_hi(xbits_hi_tmp, lz77output);
-	
 	auto xbits_ptr = xbits_hi_tmp;
+#endif
+	
 	auto last_data = _mm512_setzero_si512();
 	for(unsigned srcpos=0; srcpos<lz77output.len; srcpos+=sizeof(__m512i)) {
 		auto data = _mm512_load_si512(lz77output.data + srcpos);
@@ -378,6 +386,7 @@ static void huffman_fixed_encode(BitWriter& output, const Lz77Data& lz77output) 
 			codelo, _mm512_set1_epi64(0x8040201008040201ULL), 0
 		);
 		
+#if WINDOW_ORDER > 9
 		// insert high extra bits into codehi
 		auto has_hi_xbits = _mm512_mask_test_epi8_mask(m_xbits, codelen, _mm512_set1_epi8(8));
 		codehi = _mm512_mask_expandloadu_epi8(codehi, has_hi_xbits, xbits_ptr);
@@ -387,6 +396,7 @@ static void huffman_fixed_encode(BitWriter& output, const Lz77Data& lz77output) 
 		const auto VALID_CODEHI_BITS = _mm512_set1_epi8(127);
 		codelo = _mm512_ternarylogic_epi64(codelo, codehi, VALID_CODEHI_BITS, 0xf4); // A | (B & ~C)
 		codehi = _mm512_and_si512(codehi, VALID_CODEHI_BITS);
+#endif
 		
 		huffman_join_write(output, codelen, codelo, codehi);
 	}

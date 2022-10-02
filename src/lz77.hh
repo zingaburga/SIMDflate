@@ -330,11 +330,15 @@ static unsigned lz77_vec(__m512i data, __m128i data2, uint32_t* match_offsets, c
 			if(len_xbits > 0) {
 				auto len_xbits_bytes = 1;
 				uint16_t xbits = _bzhi_u32(off-1, len_xbits);
-				assert(len_xbits <= 13);
+				assert(len_xbits <= WINDOW_ORDER-2);
+#if WINDOW_ORDER > 9
 				// xbits is split across output and xbits_hi
 				output[lendist_pos++] = xbits & 0x7f;
 				*out_xbits_hi = xbits >> 7;
 				out_xbits_hi += (len_xbits >> 3);
+#else
+				output[lendist_pos++] = xbits;
+#endif
 			}
 			is_lendist.Write57(_bzhi_u32(15, lendist_pos - outpos), lendist_pos - outpos);
 			assert(lendist_pos - outpos <= 5 && lendist_pos - outpos >= 2);
@@ -373,7 +377,10 @@ static void lz77_encode(
 	ChecksumClass& cksum
 ) {
 	BitWriter is_lendist_writer(output.is_lendist);
-	auto* xbits_hi_ptr = output.xbits_hi;
+	uint8_t* xbits_hi_ptr = nullptr;
+#if WINDOW_ORDER > 9
+	xbits_hi_ptr = output.xbits_hi;
+#endif
 	auto _src = static_cast<const uint8_t*>(src);
 	auto src_end = _src + len;
 	
@@ -451,11 +458,13 @@ static void lz77_encode(
 	
 	// write end-of-block and pad buffer using 0s (saves having to deal with masking during later stages)
 	_mm512_storeu_si512(output.data + output.len, ZEXT128_512(_mm_cvtsi32_si128(128)));
+#if WINDOW_ORDER > 9
 	_mm512_storeu_si512(xbits_hi_ptr, _mm512_setzero_si512());
+	output.xbits_hi_len = xbits_hi_ptr - output.xbits_hi;
+#endif
 	is_lendist_writer.Write57(0xffffffff, 32);
 	is_lendist_writer.Write57(0xffffffff, 32);
 	
-	output.xbits_hi_len = xbits_hi_ptr - output.xbits_hi;
 	
 	src = _src;
 	output.len++;
