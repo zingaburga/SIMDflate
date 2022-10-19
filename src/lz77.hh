@@ -587,7 +587,6 @@ static unsigned lz77_vec(__m512i data, __m512i data2, uint32_t* match_offsets, c
 		indices2 = _mm512_and_si512(indices2, _mm512_set1_epi32(0xff));
 		
 		__mmask16 match1, match2, match3, match4;
-		__mmask32 match13, match24;
 		__m512i offsets1, offsets2;
 		if(first_vec) {
 			lz77_set_matches(source_data1, indices1, match_offsets, search_base_offset);
@@ -606,32 +605,20 @@ static unsigned lz77_vec(__m512i data, __m512i data2, uint32_t* match_offsets, c
 		match3 = _mm512_mask_cmpge_epi32_mask(match3, indices2, skip_til_index_v32);
 		match4 = _mm512_mask_cmpge_epi32_mask(match4, indices2, skip_til_index_v32);
 		
-		if(!first_vec) {
-			match13 = _mm512_kunpackw(match3, match1);
-			match24 = _mm512_kunpackw(match4, match2);
-		}
-		
-		if(!first_vec && _kortestz_mask32_u8(match13, match24) == 0) {
+		if(!first_vec && _kortestz_mask16_u8(match1, match2) == 0) {
 			__m256i match_offs, match_val;
-			if(_kortestz_mask16_u8(match1, match2) == 0) {
-				matched_lengths_sub4 = _mm256_castsi128_si256(lz77_get_match_len(indices1, data, data2, offsets1, search_base + search_base_offset, search_base, match1, match2, avail_len, match_offs, match_val));
-				matched_offsets = _mm512_castsi256_si512(match_offs);
-				match_value = _mm512_castsi256_si512(match_val);
-			} else {
-				// TODO: can these just be undefined?
-				matched_lengths_sub4 = _mm256_setzero_si256();
-				matched_offsets = _mm512_setzero_si512();
-				match_value = _mm512_setzero_si512();
-			}
+			matched_lengths_sub4 = _mm256_castsi128_si256(lz77_get_match_len(indices1, data, data2, offsets1, search_base + search_base_offset, search_base, match1, match2, avail_len, match_offs, match_val));
+			matched_offsets = _mm512_castsi256_si512(match_offs);
+			match_value = _mm512_castsi256_si512(match_val);
+			match = _kor_mask16(match1, match2);
 			
 			if(_kortestz_mask16_u8(match3, match4) == 0) {
 				matched_lengths_sub4 = _mm256_inserti128_si256(matched_lengths_sub4, lz77_get_match_len(indices2, data, data2, offsets2, search_base + search_base_offset, search_base, match3, match4, avail_len, match_offs, match_val), 1);
 				matched_offsets = _mm512_inserti64x4(matched_offsets, match_offs, 1);
 				match_value = _mm512_inserti64x4(match_value, match_val, 1);
+				match = _mm512_kunpackw(_kor_mask16(match3, match4), match);
 			}
-			
-			match = _kor_mask32(match13, match24);
-		} else if(first_vec && _kortestz_mask16_u8(match3, match4) == 0) {
+		} else if(_kortestz_mask16_u8(match3, match4) == 0) {
 			__m256i match_offs, match_val;
 			matched_lengths_sub4 = _mm256_castsi128_si256(lz77_get_match_len(indices2, data, data2, offsets2, search_base + search_base_offset, search_base, match3, match4, avail_len, match_offs, match_val));
 			matched_offsets = _mm512_castsi256_si512(match_offs);
