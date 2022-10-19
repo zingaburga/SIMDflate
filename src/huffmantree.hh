@@ -32,19 +32,6 @@ static HEDLEY_ALWAYS_INLINE void pack_bytes(__m512i in0, __m512i in1, __m512i& o
 }
 
 
-// alternatives to _mm*_mask_compressstoreu_epi* which doesn't massively slow down Zen4, due to `VPCOMPRESS* [mem]` being uCode
-// unlike the intrinsic, this does a full vector write instead of a masked one, but the caller should assume the contents of unmasked elements to be undefined (as we might optimise for Intel later by using the native intrinsic)
-// likely only marginally less efficient on Intel
-static HEDLEY_ALWAYS_INLINE void compress_store_512_8(void* dest, __mmask64 mask, __m512i data) {
-	_mm512_storeu_si512(dest, _mm512_maskz_compress_epi8(mask, data));
-}
-static HEDLEY_ALWAYS_INLINE void compress_store_256_8(void* dest, __mmask32 mask, __m256i data) {
-	_mm256_storeu_si256(static_cast<__m256i*>(dest), _mm256_maskz_compress_epi8(mask, data));
-}
-static HEDLEY_ALWAYS_INLINE void compress_store_512_16(void* dest, __mmask32 mask, __m512i data) {
-	_mm512_storeu_si512(dest, _mm512_maskz_compress_epi16(mask, data));
-}
-
 
 // pre-computed lookup table for {0, 1/1, 1/3, 1/7, 1/15 ...}
 constexpr uint32_t divide_gen(unsigned n) {

@@ -187,20 +187,6 @@ static void huffman_join_write(BitWriter& output, __m512i codelen, __m512i codel
 	}
 }
 
-#if WINDOW_ORDER > 9
-static void huffman_rotate_xbits_hi(uint8_t* HEDLEY_RESTRICT xbits_hi_tmp, const Lz77Data& lz77output) {
-	for(int i=0; i<lz77output.xbits_hi_len; i+=sizeof(__m512i)) {
-		auto data = _mm512_load_si512(lz77output.xbits_hi + i);
-		// max extra-bits length is 13 bits; since 7 is stored in the lo half, there can't be more than 6 bits set here
-		assert(_mm512_test_epi8_mask(data, _mm512_set1_epi8(0b11000000)) == 0);
-		
-		// data = data >>> 1 (where >>> denotes bytewise bit-rotate)
-		data = _mm512_gf2p8affine_epi64_epi8(data, _mm512_set1_epi64(0x0204081020408001ULL), 0);
-		_mm512_store_si512(xbits_hi_tmp + i, data);
-	}
-}
-#endif
-
 // dynamic Huffman encode
 static void huffman_dyn_encode(
 	BitWriter& output,
@@ -219,12 +205,7 @@ static void huffman_dyn_encode(
 	);
 	
 #if WINDOW_ORDER > 9
-	// need to do a bit-rotate on lz77output.xbits_hi to make the main-loop code simpler
-	// the number of bytes in lz77output.xbits_hi is expected to be low, so doesn't make sense to try doing this in-loop
-	// it may make more sense to just overwrite lz77output.xbits_hi, but we'll retain its immutability for now
-	alignas(64) uint8_t xbits_hi_tmp[LZ77DATA_XBITS_HI_SIZE];
-	huffman_rotate_xbits_hi(xbits_hi_tmp, lz77output);
-	auto xbits_ptr = xbits_hi_tmp;
+	auto xbits_ptr = lz77output.xbits_hi;
 #endif
 	
 	// compute Huffman codes
@@ -315,9 +296,7 @@ static void huffman_dyn_encode(
 
 static void huffman_fixed_encode(BitWriter& output, const Lz77Data& lz77output) {
 #if WINDOW_ORDER > 9
-	alignas(64) uint8_t xbits_hi_tmp[LZ77DATA_XBITS_HI_SIZE];
-	huffman_rotate_xbits_hi(xbits_hi_tmp, lz77output);
-	auto xbits_ptr = xbits_hi_tmp;
+	auto xbits_ptr = lz77output.xbits_hi;
 #endif
 	
 	auto last_data = _mm512_setzero_si512();
@@ -404,7 +383,7 @@ static void huffman_fixed_encode(BitWriter& output, const Lz77Data& lz77output) 
 
 // Encode <= 64 bytes using fixed Huffman
 static void huffman_fixed_encode_literals(BitWriter& output, __m512i data, __mmask64 valid_mask) {
-	auto nine_bit_syms = _mm512_cmpge_epu8_mask(data, _mm512_set1_epi8(144));
+	auto nine_bit_syms = _mm512_cmpge_epu8_mask(data, _mm512_set1_epi8(int8_t(144)));
 	auto eight = _mm512_maskz_set1_epi8(valid_mask, 8);
 	auto codelen = _mm512_mask_blend_epi8(
 		nine_bit_syms, eight, _mm512_set1_epi8(9)

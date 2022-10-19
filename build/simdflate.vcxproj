@@ -106,7 +106,7 @@
       <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <DisableSpecificWarnings>4244;4267;4127;4245;4310;4365;4242;%(DisableSpecificWarnings)</DisableSpecificWarnings>
-      <AdditionalOptions>-mavx512vl -mavx512bw -mavx512vbmi -mavx512vbmi2 -mavx512vnni -mavx512vpopcntdq -mvpclmulqdq -mavx512ifma -mgfni -mpclmul -mlzcnt -mbmi -mbmi2 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>-mavx512vl -mavx512bw -mavx512vbmi -mavx512vbmi2 -mavx512vnni -mavx512vpopcntdq -mavx512bitalg -mvpclmulqdq -mavx512ifma -mavx512cd -mgfni -mpclmul -mlzcnt -mbmi -mbmi2 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>

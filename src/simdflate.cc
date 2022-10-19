@@ -1,3 +1,9 @@
+#ifdef SIMDFLATE_DBG_DUMP_LZ77
+#define _CRT_SECURE_NO_WARNINGS 1
+#include <cstdio>
+#include <cerrno>
+#endif
+
 #include "../include/simdflate.h"
 #include <vector>
 
@@ -6,7 +12,7 @@
 #endif
 #if defined(IS_X64) && \
 	(defined(_MSC_VER) && _MSC_VER >= 1920 && !defined(__clang__)) || \
-	(defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512VBMI__) && defined(__AVX512VBMI2__) && defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VPOPCNTDQ__) && defined(__VPCLMULQDQ__) && defined(__AVX512IFMA__) && defined(__GFNI__) && defined(__PCLMUL__) && defined(__LZCNT__) && defined(__BMI__) && defined(__BMI2__))
+	(defined(__AVX512F__) && defined(__AVX512VL__) && defined(__AVX512VBMI__) && defined(__AVX512VBMI2__) && defined(__AVX512BW__) && defined(__AVX512BITALG__) && defined(__AVX512VNNI__) && defined(__AVX512VPOPCNTDQ__) && defined(__VPCLMULQDQ__) && defined(__AVX512IFMA__) && defined(__AVX512CD__) && defined(__GFNI__) && defined(__PCLMUL__) && defined(__LZCNT__) && defined(__BMI__) && defined(__BMI2__))
 
 const int SIMDFLATE_COMPILER_SUPPORTED = 1;
 
@@ -227,7 +233,7 @@ static size_t deflate_main(void* HEDLEY_RESTRICT dest, const void* HEDLEY_RESTRI
 	std::vector<uint32_t> match_offsets(1 << MATCH_TABLE_ORDER); // LZ77 match indices
 	bool first_block = true;
 	uint16_t window_offset = 0;
-	unsigned skip_next_bytes = 0;
+	int skip_next_bytes = 0;
 	auto remaining_len = len;
 	while(remaining_len) {
 		auto start_src = static_cast<const uint8_t*>(src);
@@ -259,6 +265,22 @@ static size_t deflate_main(void* HEDLEY_RESTRICT dest, const void* HEDLEY_RESTRI
 		// LZ77 encode data
 		alignas(64) Lz77Data lz77data;
 		lz77_encode(lz77data, src, remaining_len, window_offset, skip_next_bytes, match_offsets.data(), first_block, cksum);
+		
+#ifdef SIMDFLATE_DBG_DUMP_LZ77
+		if(first_block) {
+			auto f = fopen(SIMDFLATE_DBG_DUMP_LZ77, "wb");
+			if(!f) {
+				fprintf(stderr, "Failed to open output file: %s\n", strerror(errno));
+				exit(1);
+			}
+			if(fwrite(lz77data.data, 1, lz77data.len, f) != lz77data.len) {
+				fprintf(stderr, "Failed to write to output file: %s\n", strerror(errno));
+				fclose(f);
+				return 1;
+			}
+			fclose(f);
+		}
+#endif
 		
 		// histogram LZ77 output
 		// TODO: consider idea of doing symbol count before lz77, and using the information to assist lz77 in using a match or not?
@@ -313,6 +335,7 @@ static size_t deflate_main(void* HEDLEY_RESTRICT dest, const void* HEDLEY_RESTRI
 			
 			dyn_block_size += dyn_header_len - 3; // add in header, except for 3-bit block header
 			
+			// TODO: consider prefetching the match table (for subsequent LZ77 round) at some point
 			if(HEDLEY_LIKELY(dyn_block_size < fixed_block_size && dyn_block_size < raw_block_size)) {
 				huffman_dyn_encode(output, huf_litlen, huf_dist, lz77data);
 			} else if(fixed_block_size < raw_block_size) {

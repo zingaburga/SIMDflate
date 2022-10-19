@@ -12,7 +12,7 @@
   - as somewhat implied above, distance symbols are mapped into the literal/length alphabet.  The latter covers the range 0-285, whilst the distance symbols are mapped to 288-317
   - since `data` is only using 8-bit units, you could consider is_lendist effectly holding the 9th bit, but for length/distance symbols, the top bit of `data` is set
   - xbits_hi holds extra-bits data for distance symbols with >7 extra bits
-    * the most significant bits are stored here, which is to be concatenated with the low bits stored in `data`
+    * the most significant bits are stored here, which is to be rotated by 1 bit to the left, then concatenated with the low bits stored in `data`
     * xbits_hi is in a packed format to save memory, where a byte is only reserved for instances with >7 extra bits
   
   Example: where [n] = extra bits value, __d = distance symbol
@@ -20,7 +20,7 @@
   Encoded as:
               data: 50, 132, 164,   0, 157, 183,    8
         is_lendist:  0,   1,   1,   1,   1,   1,    1
-          xbits_hi: 4
+          xbits_hi: 2
   Explanation:
   - first symbol is a literal (50), encoded as-is into `data`, and corresponding is_lendist bit set to 0
   - second symbol is a length=6 code: subtract 128 from it and store in `data` as 132, and set corresponding bit in is_lendist to 1
@@ -33,6 +33,7 @@
     - this distance symbol has 10 extra bits, but we can only store up to 7 bits in data
     - as a result, we'll split the extra bits into two halves: the 7 least significant bits will go in `data`, whilst the remaining 3 bits will go to xbits_hi
     - the lower half's value is 8, whilst the upper half is 4, since 520 = (4<<7) + 8
+    - the upper half needs to be bit rotated by 1 to the right, i.e. the bottom bit is rotated to the top bit, meaning the value becomes 2
     - write the lower half to `data`, and the upper half to xbits_hi
   
   Compared to the more normal layout of using 16-bit per symbol entries, this memory layout uses much less (cache) memory, as most symbols only consume 9 bits, and can be processed reasonably efficiently

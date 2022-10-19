@@ -25,7 +25,9 @@
 // 12 means 2^12 = 4096 entries, so 4B * 4096 = 16KB in size
 const size_t MATCH_TABLE_ORDER = 12;
 // size of LZ77 sliding window
-const size_t WINDOW_ORDER = 14; // = 16KB; max LZ77 window is 32KB (order=15)
+#define WINDOW_ORDER 14 // = 16KB; max LZ77 window is 32KB (order=15)
+// note that lz77_get_match_len may currently behave incorrectly when WINDOW_ORDER==15, due to overflowing a 16-bit signed int
+
 // size of LZ77 output buffer; once this is filled, a block will be written
 // note that histogramming uses 2x16-bit counters, meaning this value can't exceed 128KB (until sampling is introduced), but it's recommended to not exceed 64KB too much (reduced sampling accuracy due to using 16-bit counters)
 // should also be larger than 128 bytes
@@ -100,13 +102,30 @@ template<typename fn>
 static HEDLEY_ALWAYS_INLINE void loop_u8x64(size_t size, const void* data, __m512i invalid_data, fn&& f) {
 	loop_u8x64(size, data, invalid_data, [&f](__m512i vdata, size_t& i) {
 		f(vdata, _cvtu64_mask64(-1LL), i);
-	}, [&f](__m512i vdata, __mmask64 mask, size_t& i, size_t len) {
+	}, [&f](__m512i vdata, __mmask64 mask, size_t& i, size_t) {
 		f(vdata, mask, i);
 	});
 }
 template<typename fn>
 static HEDLEY_ALWAYS_INLINE void loop_u8x64(size_t size, const void* data, fn&& f) {
 	loop_u8x64(size, data, _mm512_setzero_si512(), f);
+}
+
+
+// alternatives to _mm*_mask_compressstoreu_epi* which doesn't massively slow down Zen4, due to `VPCOMPRESS* [mem]` being uCode
+// unlike the intrinsic, this does a full vector write instead of a masked one, but the caller should assume the contents of unmasked elements to be undefined (as we might optimise for Intel later by using the native intrinsic)
+// likely only marginally less efficient on Intel
+static HEDLEY_ALWAYS_INLINE void compress_store_512_8(void* dest, __mmask64 mask, __m512i data) {
+	_mm512_storeu_si512(dest, _mm512_maskz_compress_epi8(mask, data));
+}
+static HEDLEY_ALWAYS_INLINE void compress_store_256_8(void* dest, __mmask32 mask, __m256i data) {
+	_mm256_storeu_si256(static_cast<__m256i*>(dest), _mm256_maskz_compress_epi8(mask, data));
+}
+static HEDLEY_ALWAYS_INLINE void compress_store_512_16(void* dest, __mmask32 mask, __m512i data) {
+	_mm512_storeu_si512(dest, _mm512_maskz_compress_epi16(mask, data));
+}
+static HEDLEY_ALWAYS_INLINE void compress_store_512_32(void* dest, __mmask16 mask, __m512i data) {
+	_mm512_storeu_si512(dest, _mm512_maskz_compress_epi32(mask, data));
 }
 
 
