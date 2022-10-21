@@ -118,158 +118,341 @@ static HEDLEY_ALWAYS_INLINE __m512i vec512_16_log2(__m512i v) {
 	return _mm512_popcnt_epi16(v);
 }
 
-static HEDLEY_ALWAYS_INLINE __m128i lz77_get_match_len(__m512i idx, __m512i data0, __m512i data1, __m512i offsets, const uint8_t* idx_base, const uint8_t* offset_base, __mmask16 match1, __mmask16 match2, size_t avail_len, __m256i& selected_offsets, __m256i& selected_value) {
-	alignas(64) int16_t off_mem[32];
-	// TODO: for WINDOW_ORDER==15, off_mem could incorrectly wrap
+static HEDLEY_ALWAYS_INLINE __m256i lz77_get_match_short(int num_match, __m256i compressed_idx, __m512i data0, __m512i data1, __m512i compressed_offsets, const uint8_t* offset_base) {
+	assert(num_match > 0 && num_match <= 32);
+	
+	auto perm_idx_idx = VEC512_8(_x/8);
+	const auto SPREAD_IDX = VEC512_8((_x&7) +4); // +4 to go past already matched 4 bytes
+	
+	auto do_match8 = [&](__m256i offs) -> uint64_t {
+		auto cmp_offs = _mm512_i32gather_epi64(offs, offset_base, 1);
+		auto cmp_idx = _mm512_permutex2var_epi8(
+			data0,
+			// TODO: could replace VPERMB here with a PSHUFB, if pre-arranged
+			_mm512_add_epi8(_mm512_permutexvar_epi8(perm_idx_idx, _mm512_castsi256_si512(compressed_idx)), SPREAD_IDX),
+			data1
+		);
+		perm_idx_idx = _mm512_add_epi8(perm_idx_idx, _mm512_set1_epi8(8));
+		return _cvtmask64_u64(_mm512_cmpeq_epi8_mask(cmp_idx, cmp_offs));
+	};
+	// TODO: investigate smaller gathers
+	
+	switch((num_match+7) >> 3) {
+		case 1: {
+			return _mm256_castsi128_si256(_mm_cvtsi64_si128(
+				do_match8(_mm256_cvtepi16_epi32(_mm512_castsi512_si128(compressed_offsets)))
+			));
+		} case 2: {
+			auto offs1 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(compressed_offsets));
+			uint64_t cmp0 = do_match8(_mm512_castsi512_si256(offs1));
+			uint64_t cmp1 = do_match8(_mm512_extracti64x4_epi64(offs1, 1));
+			return _mm256_castsi128_si256(_mm_insert_epi64(
+				_mm_cvtsi64_si128(cmp0), cmp1, 1
+			));
+		} case 3: {
+			auto offs1 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(compressed_offsets));
+			auto offs2 = _mm256_cvtepi16_epi32(_mm512_extracti32x4_epi32(compressed_offsets, 2));
+			uint64_t cmp0 = do_match8(_mm512_castsi512_si256(offs1));
+			uint64_t cmp1 = do_match8(_mm512_extracti64x4_epi64(offs1, 1));
+			uint64_t cmp2 = do_match8(offs2);
+			return _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_insert_epi64(
+				_mm_cvtsi64_si128(cmp0), cmp1, 1
+			)), _mm_cvtsi64_si128(cmp2), 1);
+		} case 4: {
+			auto offs1 = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(compressed_offsets));
+			auto offs2 = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(compressed_offsets, 1));
+			uint64_t cmp0 = do_match8(_mm512_castsi512_si256(offs1));
+			uint64_t cmp1 = do_match8(_mm512_extracti64x4_epi64(offs1, 1));
+			uint64_t cmp2 = do_match8(_mm512_castsi512_si256(offs2));
+			uint64_t cmp3 = do_match8(_mm512_extracti64x4_epi64(offs2, 1));
+			return _mm256_inserti128_si256(
+				_mm256_castsi128_si256(_mm_insert_epi64(_mm_cvtsi64_si128(cmp0), cmp1, 1)),
+				_mm_insert_epi64(_mm_cvtsi64_si128(cmp2), cmp3, 1),
+				1
+			);
+		} default: HEDLEY_UNREACHABLE();
+	}
+}
+static __m128i lz77_get_match8_len_long(int num_match, __m128i compressed_idx, const uint8_t* idx_base, __m128i compressed_offsets, const uint8_t* offset_base) {
+	assert(num_match > 0 && num_match <= 8);
+	#define DO_MATCH(n) \
+		_cvtmask64_u64(_mm512_cmpneq_epi8_mask( \
+			_mm512_loadu_si512(idx_base + _mm_extract_epi16(compressed_idx, n)), \
+			_mm512_loadu_si512(offset_base + int16_t(_mm_extract_epi16(compressed_offsets, n))) \
+		))
+	#define DO_MATCH_PAIR(n) \
+		_mm_insert_epi64( \
+			_mm_cvtsi64_si128(DO_MATCH(n)), \
+			DO_MATCH(n+1), 1 \
+		)
+	uint64_t match1 = DO_MATCH(0);
+	__m512i match_bits;
+	switch(num_match) { // TODO: quantise this more?
+		case 1:
+			return _mm_cvtsi32_si128(_tzcnt_u64(match1));
+		case 2:
+			return _mm_insert_epi8(
+				_mm_cvtsi32_si128(_tzcnt_u64(match1)), _tzcnt_u64(DO_MATCH(1)), 1
+			);
+		case 3:
+			return _mm_insert_epi8(_mm_insert_epi8(
+				_mm_cvtsi32_si128(_tzcnt_u64(match1)), _tzcnt_u64(DO_MATCH(1)), 1
+			), _tzcnt_u64(DO_MATCH(2)), 2);
+		case 4: {
+			auto match01 = _mm_insert_epi8(
+				_mm_cvtsi32_si128(_tzcnt_u64(match1)), _tzcnt_u64(DO_MATCH(1)), 1
+			);
+			uint16_t match23 = _tzcnt_u64(DO_MATCH(2)) | (_tzcnt_u64(DO_MATCH(3)) << 8);
+			
+			return _mm_insert_epi16(match01, match23, 1);
+		} case 5:
+			#define DO_MATCH03 \
+				_mm512_castsi256_si512(_mm256_inserti128_si256( \
+					_mm256_castsi128_si256(_mm_insert_epi64( \
+						_mm_cvtsi64_si128(match1), DO_MATCH(1), 1 \
+					)), \
+					DO_MATCH_PAIR(2), 1 \
+				))
+			match_bits = _mm512_inserti32x4(
+				DO_MATCH03, _mm_cvtsi64_si128(DO_MATCH(4)), 2
+			);
+			break;
+		case 6:
+			match_bits = _mm512_inserti32x4(
+				DO_MATCH03, DO_MATCH_PAIR(4), 2
+			);
+			break;
+		case 7:
+			match_bits = _mm512_inserti64x4(DO_MATCH03, _mm256_inserti128_si256(
+				_mm256_castsi128_si256(DO_MATCH_PAIR(4)),
+				_mm_cvtsi64_si128(DO_MATCH(6)), 1
+			), 1);
+			break;
+		case 8:
+			match_bits = _mm512_inserti64x4(DO_MATCH03, _mm256_inserti128_si256(
+				_mm256_castsi128_si256(DO_MATCH_PAIR(4)),
+				DO_MATCH_PAIR(6), 1
+			), 1);
+			break;
+		default: HEDLEY_UNREACHABLE();
+	}
+	#undef DO_MATCH03
+	#undef DO_MATCH_PAIR
+	#undef DO_MATCH
+	
+	auto match_lens = _mm512_popcnt_epi64(_mm512_andnot_si512(
+		match_bits, _mm512_add_epi64(match_bits, _mm512_set1_epi64(-1))
+	));
+	return _mm512_cvtepi64_epi8(match_lens);
+}
+
+static __m256i lz77_get_match_len_long(size_t avail_len, __mmask32 long_matches, __m256i match_len, __m512i idx, const uint8_t* idx_base, __m512i offsets, const uint8_t* offset_base) {
+	uint32_t long_matches_i = _cvtmask32_u32(long_matches);
+	
+	auto compressed2_offsets = _mm512_maskz_compress_epi16(long_matches, offsets);
+	auto compressed2_idx = _mm512_maskz_compress_epi16(long_matches, idx);
+	
+	for(int i=0; i<4; i++) {
+		// TODO: last iteration can be simplified a bit, but we assume a >204 match to be rare
+		if(HEDLEY_UNLIKELY(avail_len < 12 + (i+2)*sizeof(__m512i)))
+			break; // TODO: handle partial loads
+		
+		__m256i match_len_long;
+		int num_long_matches = _mm_popcnt_u32(long_matches_i);
+		
+		
+		// TODO: investigate which of these two approaches is better (seems Clang prefers first, GCC prefers second)
+		
+		switch((num_long_matches+7) >> 3) {
+			case 1:
+				match_len_long = _mm256_castsi128_si256(lz77_get_match8_len_long(
+					num_long_matches,
+					_mm512_castsi512_si128(compressed2_idx), idx_base,
+					_mm512_castsi512_si128(compressed2_offsets), offset_base
+				));
+				break;
+			case 2:
+				match_len_long = _mm256_castsi128_si256(_mm_unpacklo_epi64(
+					lz77_get_match8_len_long(
+						8,
+						_mm512_castsi512_si128(compressed2_idx), idx_base,
+						_mm512_castsi512_si128(compressed2_offsets), offset_base
+					),
+					lz77_get_match8_len_long(
+						num_long_matches - 8,
+						_mm256_extracti128_si256(_mm512_castsi512_si256(compressed2_idx), 1), idx_base,
+						_mm256_extracti128_si256(_mm512_castsi512_si256(compressed2_offsets), 1), offset_base
+					)
+				));
+				break;
+			case 3:
+				match_len_long = _mm256_castsi128_si256(_mm_unpacklo_epi64(
+					lz77_get_match8_len_long(
+						8,
+						_mm512_castsi512_si128(compressed2_idx), idx_base,
+						_mm512_castsi512_si128(compressed2_offsets), offset_base
+					),
+					lz77_get_match8_len_long(
+						8,
+						_mm256_extracti128_si256(_mm512_castsi512_si256(compressed2_idx), 1), idx_base,
+						_mm256_extracti128_si256(_mm512_castsi512_si256(compressed2_offsets), 1), offset_base
+					)
+				));
+				match_len_long = _mm256_inserti128_si256(match_len_long, lz77_get_match8_len_long(
+					num_long_matches - 16,
+					_mm512_extracti32x4_epi32(compressed2_idx, 2), idx_base,
+					_mm512_extracti32x4_epi32(compressed2_offsets, 2), offset_base
+				), 1);
+				break;
+			case 4: {
+				match_len_long = _mm256_castsi128_si256(_mm_unpacklo_epi64(
+					lz77_get_match8_len_long(
+						8,
+						_mm512_castsi512_si128(compressed2_idx), idx_base,
+						_mm512_castsi512_si128(compressed2_offsets), offset_base
+					),
+					lz77_get_match8_len_long(
+						8,
+						_mm256_extracti128_si256(_mm512_castsi512_si256(compressed2_idx), 1), idx_base,
+						_mm256_extracti128_si256(_mm512_castsi512_si256(compressed2_offsets), 1), offset_base
+					)
+				));
+				auto tmp_cidx = _mm512_extracti64x4_epi64(compressed2_idx, 1);
+				auto tmp_coff = _mm512_extracti64x4_epi64(compressed2_offsets, 1);
+				match_len_long = _mm256_inserti128_si256(match_len_long, _mm_unpacklo_epi64(
+					lz77_get_match8_len_long(
+						8,
+						_mm256_castsi256_si128(tmp_cidx), idx_base,
+						_mm256_castsi256_si128(tmp_coff), offset_base
+					),
+					lz77_get_match8_len_long(
+						num_long_matches - 24,
+						_mm256_extracti128_si256(tmp_cidx, 1), idx_base,
+						_mm256_extracti128_si256(tmp_coff, 1), offset_base
+					)
+				), 1);
+				break;
+			} default: HEDLEY_UNREACHABLE();
+		}
+		
+		
+		/*
+		auto tmpc = _mm512_extracti64x4_epi64(compressed2_offsets, 1);
+		auto coff0 = _mm512_castsi512_si128(compressed2_offsets);
+		auto coff1 = _mm256_extracti128_si256(_mm512_castsi512_si256(compressed2_offsets), 1);
+		auto coff2 = _mm256_castsi256_si128(tmpc);
+		auto coff3 = _mm256_extracti128_si256(tmpc, 1);
+		tmpc = _mm512_extracti64x4_epi64(compressed2_idx, 1);
+		auto cidx0 = _mm512_castsi512_si128(compressed2_idx);
+		auto cidx1 = _mm256_extracti128_si256(_mm512_castsi512_si256(compressed2_idx), 1);
+		auto cidx2 = _mm256_castsi256_si128(tmpc);
+		auto cidx3 = _mm256_extracti128_si256(tmpc, 1);
+		
+		__mmask64 cmp_match;
+		__m128i match_len_tmp, match_len_tmp1 = _mm_undefined_si128(), match_len_tmp2 = _mm_undefined_si128();
+		auto cmp_match_pair = _mm_undefined_si128();
+		auto cmp_matches = _mm512_undefined_epi32();
+		switch(num_long_matches) { // might make more sense to quantize this
+			default: HEDLEY_UNREACHABLE();
+			#define MATCH_CASE(n, coff, cidx) \
+				HEDLEY_FALL_THROUGH; \
+				case (n)+1: \
+					cmp_match = _mm512_cmpeq_epi8_mask( \
+						_mm512_loadu_si512(idx_base + _mm_extract_epi16(cidx, (n)&7)), \
+						_mm512_loadu_si512(offset_base + int16_t(_mm_extract_epi16(coff, (n)&7))) \
+					); \
+					cmp_match_pair = _mm_insert_epi64(cmp_match_pair, _cvtmask64_u64(cmp_match), (n)&1)
+			#define MATCH_CASE2(n, coff, cidx) \
+				MATCH_CASE(n+1, coff, cidx); \
+				MATCH_CASE(n, coff, cidx); \
+				cmp_matches = _mm512_inserti32x4(cmp_matches, cmp_match_pair, ((n)/2)&3); \
+				cmp_match_pair = _mm_setzero_si128()
+			#define MATCH_CASE8(n, coff, cidx) \
+				MATCH_CASE2(n+6, coff, cidx); \
+				MATCH_CASE2(n+4, coff, cidx); \
+				MATCH_CASE2(n+2, coff, cidx); \
+				MATCH_CASE2(n, coff, cidx); \
+				match_len_tmp = _mm512_cvtepi64_epi8(_mm512_popcnt_epi64(_mm512_andnot_si512( \
+					_mm512_add_epi64(cmp_matches, _mm512_set1_epi64(1)), cmp_matches \
+				)))
+			
+			MATCH_CASE8(24, coff3, cidx3);
+			match_len_tmp2 = match_len_tmp;
+			MATCH_CASE8(16, coff2, cidx2);
+			match_len_tmp2 = _mm_unpacklo_epi64(match_len_tmp, match_len_tmp2);
+			MATCH_CASE8(8, coff1, cidx1);
+			match_len_tmp1 = match_len_tmp;
+			MATCH_CASE8(0, coff0, cidx0);
+			match_len_tmp1 = _mm_unpacklo_epi64(match_len_tmp, match_len_tmp1);
+			match_len_long = _mm256_inserti128_si256(_mm256_castsi128_si256(match_len_tmp1), match_len_tmp2, 1);
+			
+			#undef MATCH_CASE8
+			#undef MATCH_CASE2
+			#undef MATCH_CASE
+		}*/
+		
+		
+		match_len_long = _mm256_maskz_expand_epi8(long_matches, match_len_long);
+		match_len = _mm256_adds_epu8(match_len, match_len_long);
+		
+		long_matches = _mm256_test_epi8_mask(match_len_long, _mm256_set1_epi8(64));
+		long_matches_i = _cvtmask32_u32(long_matches);
+		if(HEDLEY_LIKELY(long_matches_i == 0)) break;
+		// TODO: since we've got at least one match that's 76 bytes long, assume it's a nice length, extend that, and ignore everything afterwards
+		
+		offsets = _mm512_add_epi16(offsets, _mm512_set1_epi16(sizeof(__m512i)));
+		idx = _mm512_add_epi16(idx, _mm512_set1_epi16(sizeof(__m512i)));
+		compressed2_offsets = _mm512_maskz_compress_epi16(long_matches, offsets);
+		compressed2_idx = _mm512_maskz_compress_epi16(long_matches, idx);
+	}
+	return match_len;
+}
+
+static HEDLEY_ALWAYS_INLINE __m128i lz77_get_match_len(__m128i idx, __m512i data0, __m512i data1, __m512i offsets, const uint8_t* idx_base, const uint8_t* offset_base, __mmask16 match1, __mmask16 match2, size_t avail_len, __m256i& selected_offsets, __m256i& selected_value) {
+	// TODO: for WINDOW_ORDER==15, offsets could incorrectly wrap when added to
 	
 	// TODO: consider detecting continuations?  not strictly necessary, as will be eliminated later, but reduces lookups
 	
 	auto match = _mm512_kunpackw(match2, match1);
-	idx = _mm512_permutexvar_epi16(VEC512_16(_x*2), idx); // pack 32b -> 16b, and duplicate to upper 256b
+	uint32_t match_i = _cvtmask32_u32(match);
 	offsets = _mm512_permutexvar_epi16(VEC512_16(_x*2 + (_x>15)), offsets);
 	
-	auto compressed_idx = _mm512_maskz_compress_epi16(match, idx);
+	auto idx_x2 = _mm256_inserti128_si256(_mm256_castsi128_si256(idx), idx, 1);
+	auto compressed_idx = _mm256_maskz_compress_epi8(match, idx_x2);
 	auto compressed_offsets = _mm512_maskz_compress_epi16(match, _mm512_add_epi16(offsets, _mm512_set1_epi16(4))); // skip past already matched 4 bytes
-	_mm512_store_si512(off_mem, compressed_offsets);
-	
-	auto perm_idx_idx = VEC512_8((_x/16) * 2);
-	const auto SPREAD_IDX = VEC512_8((_x&15) +4); // +4 to go past already matched 4 bytes
-	
-	uint32_t match_i = _cvtmask32_u32(match);
-	auto cmp0 = _mm512_undefined_epi32();
-	auto cmp_matches = _mm512_undefined_epi32();
-	auto cmp_match_pair = _mm_undefined_si128();
 	
 	int num_match = _mm_popcnt_u32(match_i);
 	ASSUME(num_match > 0 && num_match <= 32);
 	
-	perm_idx_idx = _mm512_add_epi8(perm_idx_idx, _mm512_set1_epi8(((num_match-1) & ~3)*2));
-	__m512i cmp_idx;
 	
-	switch(num_match) { // might make more sense to quantize this
-		default: HEDLEY_UNREACHABLE();
-		#define MATCH_CASE(n) \
-			HEDLEY_FALL_THROUGH; \
-			case (n)+1: \
-				cmp0 = _mm512_inserti32x4(cmp0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(offset_base + off_mem[n])), (n)&3)
-				
-		#define MATCH_CASE4(n) \
-			MATCH_CASE(n+3); \
-			MATCH_CASE(n+2); \
-			MATCH_CASE(n+1); \
-			MATCH_CASE(n); \
-			cmp_idx = _mm512_permutex2var_epi8( \
-				data0, \
-				_mm512_add_epi8(_mm512_permutexvar_epi8(perm_idx_idx, compressed_idx), SPREAD_IDX), \
-				data1 \
-			); \
-			perm_idx_idx = _mm512_add_epi8(perm_idx_idx, _mm512_set1_epi8(-8)); \
-			cmp_match_pair = _mm_insert_epi64( \
-				cmp_match_pair, _cvtmask64_u64(_mm512_cmpeq_epi8_mask(cmp_idx, cmp0)), ((n)>>2)&1 \
-			)
-		#define MATCH_CASE8(n) \
-			MATCH_CASE4(n+4); \
-			MATCH_CASE4(n); \
-			cmp_matches = _mm512_inserti32x4(cmp_matches, cmp_match_pair, ((n)>>3) & 3)
-		
-		MATCH_CASE8(24);
-		MATCH_CASE8(16);
-		MATCH_CASE8(8);
-		MATCH_CASE8(0);
-		
-		#undef MATCH_CASE8
-		#undef MATCH_CASE4
-		#undef MATCH_CASE
-	}
-	
-	// get match lengths
-	auto match_len = _mm512_maskz_cvtepi16_epi8(
+	// extend 4B matches by 8 bytes
+	auto match_bits = lz77_get_match_short(num_match, compressed_idx, data0, data1, compressed_offsets, offset_base);
+	auto match_len_sub4 = _mm256_maskz_popcnt_epi8(
 		_cvtu32_mask32(_bzhi_u32(-1, num_match)),
-		_mm512_popcnt_epi16(_mm512_andnot_si512(
-			_mm512_add_epi16(cmp_matches, _mm512_set1_epi16(1)), cmp_matches
-		))
+		_mm256_andnot_si256(
+			_mm256_add_epi8(match_bits, _mm256_set1_epi8(1)), match_bits
+		)
 	);
 	
-	auto long_matches = _mm256_test_epi8_mask(match_len, _mm256_set1_epi8(16));
+	// if we have >=12 byte matches, extend them to their full length
+	auto long_matches = _mm256_test_epi8_mask(match_len_sub4, _mm256_set1_epi8(8));
 	uint32_t long_matches_i = _cvtmask32_u32(long_matches);
 	// TODO: consider extending lengths only after conflict resolution?
 	if(long_matches_i != 0) {
-		// find true match lengths, taking into consideration the buffer size
-		compressed_offsets = _mm512_add_epi16(compressed_offsets, _mm512_set1_epi16(sizeof(__m128i)));
-		compress_store_512_16(off_mem, long_matches, compressed_offsets);
-		alignas(64) uint16_t idx_mem[32];
-		auto compressed_idx2 = _mm512_add_epi16(compressed_idx, _mm512_set1_epi16(4 + sizeof(__m128i)));
-		compress_store_512_16(idx_mem, long_matches, compressed_idx2);
-		
-		__mmask64 cmp_match;
-		__m128i match_len_tmp, match_len_tmp1 = _mm_setzero_si128(), match_len_tmp2 = _mm_setzero_si128();
-		__m256i match_len_long;
-		for(int i=0; i<4; i++) {
-			// TODO: last iteration can be simplified a bit
-			if(HEDLEY_UNLIKELY(avail_len < 20 + (i+2)*sizeof(__m512i)))
-				break; // TODO: handle partial loads
-			
-			cmp_match_pair = _mm_setzero_si128();
-			cmp_matches = _mm512_setzero_si512();
-			switch(_mm_popcnt_u32(long_matches_i)) { // might make more sense to quantize this
-				default: HEDLEY_UNREACHABLE();
-				#define MATCH_CASE(n) \
-					HEDLEY_FALL_THROUGH; \
-					case (n)+1: \
-						cmp_match = _mm512_cmpeq_epi8_mask( \
-							_mm512_loadu_si512(idx_base + idx_mem[n]), \
-							_mm512_loadu_si512(offset_base + off_mem[n]) \
-						); \
-						cmp_match_pair = _mm_insert_epi64(cmp_match_pair, _cvtmask64_u64(cmp_match), (n)&1)
-				#define MATCH_CASE2(n) \
-					MATCH_CASE(n+1); \
-					MATCH_CASE(n); \
-					cmp_matches = _mm512_inserti32x4(cmp_matches, cmp_match_pair, ((n)/2)&3); \
-					cmp_match_pair = _mm_setzero_si128()
-				#define MATCH_CASE8(n) \
-					MATCH_CASE2(n+6); \
-					MATCH_CASE2(n+4); \
-					MATCH_CASE2(n+2); \
-					MATCH_CASE2(n); \
-					match_len_tmp = _mm512_cvtepi64_epi8(_mm512_popcnt_epi64(_mm512_andnot_si512( \
-						_mm512_add_epi64(cmp_matches, _mm512_set1_epi64(1)), cmp_matches \
-					)))
-				
-				MATCH_CASE8(24);
-				match_len_tmp2 = match_len_tmp;
-				MATCH_CASE8(16);
-				match_len_tmp2 = _mm_unpacklo_epi64(match_len_tmp, match_len_tmp2);
-				MATCH_CASE8(8);
-				match_len_tmp1 = match_len_tmp;
-				MATCH_CASE8(0);
-				match_len_tmp1 = _mm_unpacklo_epi64(match_len_tmp, match_len_tmp1);
-				match_len_long = _mm256_inserti128_si256(_mm256_castsi128_si256(match_len_tmp1), match_len_tmp2, 1);
-				
-				#undef MATCH_CASE8
-				#undef MATCH_CASE2
-				#undef MATCH_CASE
-			}
-			
-			match_len_long = _mm256_maskz_expand_epi8(long_matches, match_len_long);
-			match_len = _mm256_adds_epu8(match_len, match_len_long);
-			
-			
-			long_matches = _mm256_test_epi8_mask(match_len_long, _mm256_set1_epi8(64));
-			long_matches_i = _cvtmask32_u32(long_matches);
-			if(HEDLEY_LIKELY(long_matches_i == 0)) break;
-			
-			compressed_offsets = _mm512_add_epi16(compressed_offsets, _mm512_set1_epi16(sizeof(__m512i)));
-			compress_store_512_16(off_mem, long_matches, compressed_offsets);
-			compressed_idx2 = _mm512_add_epi16(compressed_idx2, _mm512_set1_epi16(sizeof(__m512i)));
-			compress_store_512_16(idx_mem, long_matches, compressed_idx2);
-		}
-		// TODO: perhaps do nice len handling here?
+		match_len_sub4 = lz77_get_match_len_long(
+			avail_len, long_matches, match_len_sub4,
+			_mm512_add_epi16(_mm512_cvtepu8_epi16(compressed_idx), _mm512_set1_epi16(12)),
+			idx_base,
+			_mm512_add_epi16(compressed_offsets, _mm512_set1_epi16(8)),
+			offset_base
+		);
+		// TODO: nice length handling??
 	}
 	
 	
 	// determine actual offsets
 	assert(idx_base - offset_base <= (1<<WINDOW_ORDER));
-	auto idx_offsets = _mm512_add_epi16(idx, _mm512_set1_epi16(idx_base-offset_base));
+	auto idx_offsets = _mm512_add_epi16(_mm512_cvtepu8_epi16(idx_x2), _mm512_set1_epi16(idx_base-offset_base));
 	// offsets need to be 0-based, so subtract an additional 1 from it
 	// note that `idx_offsets - offsets - 1` == `idx_offsets + ~offsets`
 	offsets = _mm512_add_epi16(
@@ -278,7 +461,7 @@ static HEDLEY_ALWAYS_INLINE __m128i lz77_get_match_len(__m512i idx, __m512i data
 	);
 	assert(_mm512_mask_cmpge_epu16_mask(match, offsets, _mm512_set1_epi16(1<<WINDOW_ORDER)) == 0);
 	
-	auto match_len_x = _mm256_maskz_expand_epi8(match, match_len);
+	auto match_len_x = _mm256_maskz_expand_epi8(match, match_len_sub4);
 	// resolve same idx matches
 	// compute the match cost saving
 	auto match_value = _mm512_shldi_epi16(_mm512_cvtepu8_epi16(match_len_x), _mm512_set1_epi16(-1), LZ77_LITERAL_BITCOST_LOG2);
@@ -295,6 +478,138 @@ static HEDLEY_ALWAYS_INLINE __m128i lz77_get_match_len(__m512i idx, __m512i data
 	selected_offsets = _mm256_mask_mov_epi16(_mm512_castsi512_si256(offsets), swap, _mm512_extracti64x4_epi64(offsets, 1));
 	selected_value = _mm256_mask_mov_epi16(match_value1, swap, match_value2);
 	return _mm_mask_mov_epi8(_mm256_castsi256_si128(match_len_x), swap, _mm256_extracti128_si256(match_len_x, 1));
+}
+
+static __m256i lz77_get_match_len_x2(__m256i idx, __m512i data0, __m512i data1, __m512i offsets1, __m512i offsets2, const uint8_t* idx_base, const uint8_t* offset_base, __mmask32 match1, __mmask32 match2, size_t avail_len, __m512i& selected_offsets, __m512i& selected_value) {
+	assert(idx_base - offset_base <= (1<<WINDOW_ORDER));
+	
+	auto match = _mm512_kunpackd(match2, match1);
+	int num_match = _mm_popcnt_u64(_cvtmask64_u64(match));
+	ASSUME(num_match > 0 && num_match <= 64);
+	
+	int num_match1 = _mm_popcnt_u32(_cvtmask32_u32(match1));
+	
+	auto tmp_offsets1 = _mm512_permutexvar_epi16(VEC512_16(_x*2 + (_x>15)), offsets1);
+	auto tmp_offsets2 = _mm512_permutexvar_epi16(VEC512_16(_x*2 + (_x>15)), offsets2);
+	offsets1 = _mm512_inserti64x4(tmp_offsets1, _mm512_castsi512_si256(tmp_offsets2), 1);
+	offsets2 = _mm512_shuffle_i64x2(tmp_offsets1, tmp_offsets2, _MM_SHUFFLE(3,2,3,2));
+	
+	auto compressed_offsets1 = _mm512_add_epi16(offsets1, _mm512_set1_epi16(4));
+	auto compressed_offsets2 = _mm512_add_epi16(offsets2, _mm512_set1_epi16(4));
+	__m512i match_len_sub4;
+	
+	if(num_match <= 32) {
+		// combine compressed_offsets into one
+		auto compressed_offsets = _mm512_maskz_compress_epi16(match2, compressed_offsets2);
+		auto shift_idx = _mm512_sub_epi16(VEC512_16(_x), _mm512_set1_epi16(num_match1));
+		compressed_offsets = _mm512_permutexvar_epi16(shift_idx, compressed_offsets);
+		compressed_offsets = _mm512_mask_compress_epi16(compressed_offsets, match1, compressed_offsets1);
+		
+		auto compressed_idx = _mm512_castsi512_si256(_mm512_maskz_compress_epi8(match, _mm512_inserti64x4(_mm512_castsi256_si512(idx), idx, 1)));
+		
+		auto match_bits = lz77_get_match_short(num_match, compressed_idx, data0, data1, compressed_offsets, offset_base);
+		auto match_len32 = _mm256_maskz_popcnt_epi8(
+			_cvtu32_mask32(_bzhi_u32(-1, num_match)),
+			_mm256_andnot_si256(
+				_mm256_add_epi8(match_bits, _mm256_set1_epi8(1)), match_bits
+			)
+		);
+		
+		auto long_matches = _mm256_test_epi8_mask(match_len32, _mm256_set1_epi8(8));
+		uint32_t long_matches_i = _cvtmask32_u32(long_matches);
+		if(long_matches_i != 0) {
+			match_len32 = lz77_get_match_len_long(
+				avail_len, long_matches, match_len32,
+				_mm512_add_epi16(_mm512_cvtepu8_epi16(compressed_idx), _mm512_set1_epi16(12)),
+				idx_base,
+				_mm512_add_epi16(compressed_offsets, _mm512_set1_epi16(8)),
+				offset_base
+			);
+		}
+		match_len_sub4 = _mm512_castsi256_si512(match_len32);
+	} else {
+		assert(match1 != 0 && match2 != 0); // if > 32 matches, each 32-bit component is guaranteed to have at least one bit set
+		
+		int num_match2 = num_match - num_match1;
+		auto compressed_idx1 = _mm256_maskz_compress_epi8(match1, idx);
+		auto compressed_offs1 = _mm512_maskz_compress_epi16(match1, compressed_offsets1);
+		auto compressed_idx2 = _mm256_maskz_compress_epi8(match2, idx);
+		auto compressed_offs2 = _mm512_maskz_compress_epi16(match2, compressed_offsets2);
+		auto match_bits1 = lz77_get_match_short(
+			num_match1, compressed_idx1,
+			data0, data1,
+			compressed_offs1, offset_base
+		);
+		auto match_bits2 = lz77_get_match_short(
+			num_match2, compressed_idx2,
+			data0, data1,
+			compressed_offs2, offset_base
+		);
+		
+		auto match_bits = _mm512_inserti64x4(_mm512_castsi256_si512(match_bits1), match_bits2, 1);
+		auto match_mask = _cvtu64_mask64(_bzhi_u32(-1, num_match1) | (uint64_t(_bzhi_u32(-1, num_match2)) << 32));
+		match_len_sub4 = _mm512_maskz_popcnt_epi8(match_mask, _mm512_andnot_si512(
+			_mm512_add_epi8(match_bits, _mm512_set1_epi8(1)), match_bits
+		));
+		
+		auto long_matches = _mm512_test_epi8_mask(match_len_sub4, _mm512_set1_epi8(8));
+		uint64_t long_matches_i = _cvtmask64_u64(long_matches);
+		if(long_matches_i != 0) {
+			__m512i match_len2 = _mm512_setzero_si512();
+			// TODO: see if can merge into one call if num matches <= 32
+			if(long_matches_i & 0xffffffff) {
+				match_len2 = _mm512_castsi256_si512(lz77_get_match_len_long(
+					avail_len, long_matches, _mm512_castsi512_si256(match_len_sub4),
+					_mm512_add_epi16(_mm512_cvtepu8_epi16(compressed_idx1), _mm512_set1_epi16(12)),
+					idx_base,
+					_mm512_add_epi16(compressed_offs1, _mm512_set1_epi16(8)),
+					offset_base
+				));
+			}
+			long_matches = _kshiftri_mask64(long_matches, 32);
+			if(!_ktestz_mask32_u8(long_matches, long_matches)) {
+				match_len2 = _mm512_inserti64x4(match_len2, lz77_get_match_len_long(
+					avail_len, long_matches, _mm512_extracti64x4_epi64(match_len_sub4, 1),
+					_mm512_add_epi16(_mm512_cvtepu8_epi16(compressed_idx2), _mm512_set1_epi16(12)),
+					idx_base,
+					_mm512_add_epi16(compressed_offs2, _mm512_set1_epi16(8)),
+					offset_base
+				), 1);
+			}
+			match_len_sub4 = match_len2;
+		}
+		match_len_sub4 = _mm512_maskz_compress_epi8(match_mask, match_len_sub4);
+	}
+	
+	
+	auto idx_offsets = _mm512_add_epi16(_mm512_cvtepu8_epi16(idx), _mm512_set1_epi16(idx_base-offset_base));
+	offsets1 = _mm512_add_epi16(
+		idx_offsets,
+		_mm512_ternarylogic_epi64(offsets1, offsets1, offsets1, 0xf) // ~A
+	);
+	offsets2 = _mm512_add_epi16(
+		idx_offsets,
+		_mm512_ternarylogic_epi64(offsets2, offsets2, offsets2, 0xf) // ~A
+	);
+	assert(_mm512_mask_cmpge_epu16_mask(match1, offsets1, _mm512_set1_epi16(1<<WINDOW_ORDER)) == 0);
+	assert(_mm512_mask_cmpge_epu16_mask(match2, offsets2, _mm512_set1_epi16(1<<WINDOW_ORDER)) == 0);
+	
+	auto match_len_x = _mm512_maskz_expand_epi8(match, match_len_sub4);
+	auto match_len_x1 = _mm512_castsi512_si256(match_len_x);
+	auto match_len_x2 = _mm512_extracti64x4_epi64(match_len_x, 1);
+	// resolve same idx matches
+	// compute the match cost saving
+	auto match_value1 = _mm512_shldi_epi16(_mm512_cvtepu8_epi16(match_len_x1), _mm512_set1_epi16(-1), LZ77_LITERAL_BITCOST_LOG2);
+	auto match_value2 = _mm512_shldi_epi16(_mm512_cvtepu8_epi16(match_len_x2), _mm512_set1_epi16(-1), LZ77_LITERAL_BITCOST_LOG2);
+	match_value1 = _mm512_sub_epi16(match_value1, vec512_16_log2(offsets1));
+	match_value2 = _mm512_sub_epi16(match_value2, vec512_16_log2(offsets2));
+	match_value1 = _mm512_maskz_add_epi16(match1, match_value1, _mm512_set1_epi16(4 << LZ77_LITERAL_BITCOST_LOG2));
+	match_value2 = _mm512_maskz_add_epi16(match2, match_value2, _mm512_set1_epi16(4 << LZ77_LITERAL_BITCOST_LOG2));
+	
+	auto swap = _mm512_cmpgt_epi16_mask(match_value2, match_value1);
+	selected_offsets = _mm512_mask_mov_epi16(offsets1, swap, offsets2);
+	selected_value = _mm512_mask_mov_epi16(match_value1, swap, match_value2);
+	return _mm256_mask_mov_epi8(match_len_x1, swap, match_len_x2);
 }
 
 template<typename T>
@@ -553,7 +868,7 @@ static unsigned lz77_vec(__m512i data, __m512i data2, uint32_t* match_offsets, c
 		
 		if(!first_vec && _kortestz_mask16_u8(match1, match2) == 0) {
 			__m256i match_offs, match_val;
-			matched_lengths_sub4 = _mm256_castsi128_si256(lz77_get_match_len(indices, data, data2, offsets, search_base + search_base_offset, search_base, match1, match2, avail_len, match_offs, match_val));
+			matched_lengths_sub4 = _mm256_castsi128_si256(lz77_get_match_len(_mm256_castsi256_si128(match_indices), data, data2, offsets, search_base + search_base_offset, search_base, match1, match2, avail_len, match_offs, match_val));
 			matched_offsets = _mm512_castsi256_si512(match_offs);
 			match_value = _mm512_castsi256_si512(match_val);
 			match = _kor_mask16(match1, match2);
@@ -606,27 +921,19 @@ static unsigned lz77_vec(__m512i data, __m512i data2, uint32_t* match_offsets, c
 		match4 = _mm512_mask_cmpge_epi32_mask(match4, indices2, skip_til_index_v32);
 		
 		if(!first_vec && _kortestz_mask16_u8(match1, match2) == 0) {
-			__m256i match_offs, match_val;
-			matched_lengths_sub4 = _mm256_castsi128_si256(lz77_get_match_len(indices1, data, data2, offsets1, search_base + search_base_offset, search_base, match1, match2, avail_len, match_offs, match_val));
-			matched_offsets = _mm512_castsi256_si512(match_offs);
-			match_value = _mm512_castsi256_si512(match_val);
-			match = _kor_mask16(match1, match2);
-			
-			if(_kortestz_mask16_u8(match3, match4) == 0) {
-				matched_lengths_sub4 = _mm256_inserti128_si256(matched_lengths_sub4, lz77_get_match_len(indices2, data, data2, offsets2, search_base + search_base_offset, search_base, match3, match4, avail_len, match_offs, match_val), 1);
-				matched_offsets = _mm512_inserti64x4(matched_offsets, match_offs, 1);
-				match_value = _mm512_inserti64x4(match_value, match_val, 1);
-				match = _mm512_kunpackw(_kor_mask16(match3, match4), match);
-			}
+			auto match31 = _mm512_kunpackw(match3, match1);
+			auto match42 = _mm512_kunpackw(match4, match2);
+			matched_lengths_sub4 = lz77_get_match_len_x2(match_indices, data, data2, offsets1, offsets2, search_base + search_base_offset, search_base, match31, match42, avail_len, matched_offsets, match_value);
+			match = _kor_mask32(match31, match42);
 		} else if(_kortestz_mask16_u8(match3, match4) == 0) {
 			__m256i match_offs, match_val;
-			matched_lengths_sub4 = _mm256_castsi128_si256(lz77_get_match_len(indices2, data, data2, offsets2, search_base + search_base_offset, search_base, match3, match4, avail_len, match_offs, match_val));
+			match_indices = _mm256_castsi128_si256(_mm256_extracti128_si256(match_indices, 1));
+			matched_lengths_sub4 = _mm256_castsi128_si256(lz77_get_match_len(_mm256_castsi256_si128(match_indices), data, data2, offsets2, search_base + search_base_offset, search_base, match3, match4, avail_len, match_offs, match_val));
 			matched_offsets = _mm512_castsi256_si512(match_offs);
 			match_value = _mm512_castsi256_si512(match_val);
 			match = _kor_mask16(match3, match4);
 			// because the bottom 16 are effectively skipped, we need to remove these
 			bounds = _pdep_u64(0xffff0000, bounds);
-			match_indices = _mm256_castsi128_si256(_mm256_extracti128_si256(match_indices, 1));
 		} else {
 			// no match found, store and bail
 			_mm512_mask_storeu_epi8(output - skip_til_index, _cvtu64_mask64(nonskip_mask), data);
