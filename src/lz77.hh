@@ -657,33 +657,43 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	
 	assert(mem_start[0] >= skip_til_index);
 	int prev_i = 0;
+	//int prev_prev_i = -1;
 	uint32_t selected = 0;
 	for(int i=1; i<num_match; i++) {
 		/*
 		if(mem_end[prev_i] > mem_start[i]) {
 			// conflict
-			if(mem_start[i] - mem_start[prev_i] >= 4 && int(mem_end[i]) - int(mem_end[prev_i]) >= 4) {
+			if(mem_start[i] - mem_start[prev_i] >= 4 && mem_val[i] - ((mem_end[prev_i] - mem_start[i]) << LZ77_LITERAL_BITCOST_LOG2) > (3 << LZ77_LITERAL_BITCOST_LOG2)) {
+				//   ^ 3 = fudge factor as an approximate cost of the len/dist symbols themselves
 				// shorten previous match and select it
+				if(prev_prev_i >= 0 && !((selected >> (prev_i-1)) & 1) && mem_end[prev_i-1] >= mem_start[i]) {
+					// TODO: evaluate whether this should be selected instead
+				}
 				mem_end[prev_i] = mem_start[i];
 				selected |= 1 << prev_i;
 			}
 			else if(mem_val[i] - mem_val[prev_i] <= 1) // slightly bias towards earlier match, as it's less likely to conflict
 				continue; // discard this match
+			else {
+				// discard earlier match
+				// TODO: check preceeding to see if it was better
+			}
 		} else {
 			selected |= 1 << prev_i;
 		}
+		prev_prev_i = prev_i;
 		prev_i = i;
 		*/
 		
 		lz77_cmov(mem_end[prev_i], (
-			mem_end[prev_i] > mem_start[i]
-			&& mem_start[i] - mem_start[prev_i] >= 4
-			&& int(mem_end[i]) - int(mem_end[prev_i]) >= 4
+			(mem_end[prev_i] > mem_start[i])
+			& (mem_start[i] - mem_start[prev_i] >= 4)
+			& (mem_val[i] - ((mem_end[prev_i] - mem_start[i]) << LZ77_LITERAL_BITCOST_LOG2) > (3 << LZ77_LITERAL_BITCOST_LOG2))
 		), uint16_t(mem_start[i]));
 		
 		int not_conflict = mem_end[prev_i] <= mem_start[i];
 		selected |= not_conflict << prev_i; // if current doesn't conflict with previous, select previous
-		lz77_cmov(prev_i, not_conflict || mem_val[i] - mem_val[prev_i] > 1, i); // if current match looks promising, set is as the next candidate
+		lz77_cmov(prev_i, not_conflict | (mem_val[i] - mem_val[prev_i] > 1), i); // if current match looks promising, set is as the next candidate
 	}
 	selected |= 1 << prev_i;
 	skip_til_index = mem_end[prev_i];
@@ -838,6 +848,7 @@ static unsigned lz77_vec(__m512i data, __m512i data2, uint32_t* match_offsets, c
 			data
 		)
 	));
+	// TODO: consider adding boundaries based on upper/lower case
 	
 	// detect char/special boundaries
 	uint64_t bounds = alphanum ^ (alphanum << 1);
