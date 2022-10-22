@@ -660,6 +660,7 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	//int prev_prev_i = -1;
 	uint32_t selected = 0;
 	for(int i=1; i<num_match; i++) {
+		ASSUME(prev_i < i);
 		/*
 		if(mem_end[prev_i] > mem_start[i]) {
 			// conflict
@@ -685,24 +686,33 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 		prev_i = i;
 		*/
 		
-		lz77_cmov(mem_end[prev_i], (
-			(mem_end[prev_i] > mem_start[i])
-			& (mem_start[i] - mem_start[prev_i] >= 4)
+		int not_conflict = (mem_end[prev_i] <= mem_start[i]) | (
+			// length shortening check
+			(mem_start[i] - mem_start[prev_i] >= 4)
 			& (mem_val[i] - ((mem_end[prev_i] - mem_start[i]) << LZ77_LITERAL_BITCOST_LOG2) > (3 << LZ77_LITERAL_BITCOST_LOG2))
-		), uint16_t(mem_start[i]));
-		
-		int not_conflict = mem_end[prev_i] <= mem_start[i];
+		);
 		selected |= not_conflict << prev_i; // if current doesn't conflict with previous, select previous
 		lz77_cmov(prev_i, not_conflict | (mem_val[i] - mem_val[prev_i] > 1), i); // if current match looks promising, set is as the next candidate
 	}
 	selected |= 1 << prev_i;
 	skip_til_index = mem_end[prev_i];
 	
-	match_end = _mm512_maskz_expandloadu_epi16(match, mem_end);
-	match_end = _mm512_sub_epi16(match_end, match_offset);
-	matched_lengths_sub3 = _mm512_cvtepi16_epi8(match_end);
+	uint32_t selected_match = _pdep_u32(selected, _cvtmask32_u32(match));
+	auto selected_match_m = _cvtu32_mask32(selected_match);
+	// check for overlong matches, due to length shortening
+	auto cend = _mm512_maskz_compress_epi16(selected_match_m, match_end);
+	auto cstart = _mm512_mask_compress_epi16(
+		_mm512_set1_epi16(-1),  // ensure the last 'shorten' element is 0
+		_cvtu32_mask32(_blsr_u32(selected_match)), // clearing lowest bit here will effectively shift it by 1 element
+		_mm512_cvtepu8_epi16(match_indices)
+	);
 	
-	return _pdep_u32(selected, _cvtmask32_u32(match));
+	auto shorten = _mm512_cvtepi16_epi8(_mm512_subs_epu16(cend, cstart));
+	shorten = _mm256_maskz_expand_epi8(selected_match_m, shorten);
+	assert(_mm256_cmplt_epu8(matched_lengths_sub3, shorten) == 0);
+	matched_lengths_sub3 = _mm256_sub_epi8(matched_lengths_sub3, shorten);
+	
+	return selected_match;
 }
 
 static HEDLEY_ALWAYS_INLINE __m512i lz77_symbol_encode(__m256i compressed_offsets, __m128i compressed_lengths, uint8_t* HEDLEY_RESTRICT& out_xbits_hi) {
