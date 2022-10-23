@@ -644,24 +644,44 @@ static HEDLEY_ALWAYS_INLINE void lz77_cmov(T& dest, bool cond, T new_val) {
 
 static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256i match_indices, __m512i match_value, __mmask32 match, int& skip_til_index) {
 	// compress down
-	alignas(32) uint16_t mem_end[32];
-	alignas(32) uint8_t mem_start[32];
-	alignas(64) int16_t mem_val[32];
-	auto match_offset = _mm512_add_epi16(_mm512_cvtepu8_epi16(match_indices), _mm512_set1_epi16(3));
+	auto match_start = _mm512_cvtepu8_epi16(match_indices);
+	auto match_offset = _mm512_add_epi16(match_start, _mm512_set1_epi16(3));
 	auto match_end = _mm512_add_epi16(_mm512_cvtepu8_epi16(matched_lengths_sub3), match_offset);
-	compress_store_512_16(mem_end, match, match_end);
-	compress_store_256_8(mem_start, match, match_indices);
-	compress_store_512_16(mem_val, match, match_value);
-	int num_match = _mm_popcnt_u32(_cvtmask32_u32(match));
+	// approximate comparison value for whether to shorten matches
+	auto match_shorten = _mm512_srli_epi16(match_value, LZ77_LITERAL_BITCOST_LOG2);
+	match_shorten = _mm512_add_epi16(match_shorten, match_start);
+	
+	auto compressed_end = _mm512_maskz_compress_epi16(match, match_end);
+	auto compressed_shorten = _mm512_maskz_compress_epi16(match, match_shorten);
+	auto compressed_start = _mm512_maskz_compress_epi16(match, match_start);
+	auto compressed_value = _mm512_maskz_compress_epi16(match, match_value);
+	
+	const auto PERM32 = _mm512_set_epi32(15, 11, 7, 3,  14, 10, 6, 2,  13, 9, 5, 1,  12, 8, 4, 0);
+	compressed_end = _mm512_permutexvar_epi32(PERM32, compressed_end);
+	compressed_shorten = _mm512_permutexvar_epi32(PERM32, compressed_shorten);
+	compressed_start = _mm512_permutexvar_epi32(PERM32, compressed_start);
+	compressed_value = _mm512_permutexvar_epi32(PERM32, compressed_value);
+	
+	auto tmp1 = _mm512_unpacklo_epi16(compressed_shorten, compressed_end);
+	auto tmp2 = _mm512_unpackhi_epi16(compressed_shorten, compressed_end);
+	auto tmp3 = _mm512_unpacklo_epi16(compressed_value, compressed_start);
+	auto tmp4 = _mm512_unpackhi_epi16(compressed_value, compressed_start);
+	
+	alignas(64) uint64_t mem_data[32];
+	_mm512_store_si512(mem_data, _mm512_unpacklo_epi32(tmp3, tmp1));
+	_mm512_store_si512(mem_data + 8, _mm512_unpackhi_epi32(tmp3, tmp1));
+	_mm512_store_si512(mem_data + 16, _mm512_unpacklo_epi32(tmp4, tmp2));
+	_mm512_store_si512(mem_data + 24, _mm512_unpackhi_epi32(tmp4, tmp2));
+	
+	unsigned num_match = _mm_popcnt_u32(_cvtmask32_u32(match));
 	assert(num_match > 0);
 	
-	assert(mem_start[0] >= skip_til_index);
-	int prev_i = 0;
-	//int prev_prev_i = -1;
+	assert(((mem_data[0] >> 16) & 0xff) >= skip_til_index);
+	unsigned prev_i = 0;
 	uint32_t selected = 0;
-	for(int i=1; i<num_match; i++) {
+	for(unsigned i=1; i<num_match; i++) {
 		ASSUME(prev_i < i);
-		/*
+		/*  scalar version
 		if(mem_end[prev_i] > mem_start[i]) {
 			// conflict
 			if(mem_start[i] - mem_start[prev_i] >= 4 && mem_val[i] - ((mem_end[prev_i] - mem_start[i]) << LZ77_LITERAL_BITCOST_LOG2) > (3 << LZ77_LITERAL_BITCOST_LOG2)) {
@@ -686,16 +706,32 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 		prev_i = i;
 		*/
 		
-		int not_conflict = (mem_end[prev_i] <= mem_start[i]) | (
-			// length shortening check
-			(mem_start[i] - mem_start[prev_i] >= 4)
-			& (mem_val[i] - ((mem_end[prev_i] - mem_start[i]) << LZ77_LITERAL_BITCOST_LOG2) > (3 << LZ77_LITERAL_BITCOST_LOG2))
-		);
-		selected |= not_conflict << prev_i; // if current doesn't conflict with previous, select previous
-		lz77_cmov(prev_i, not_conflict | (mem_val[i] - mem_val[prev_i] > 1), i); // if current match looks promising, set is as the next candidate
+		auto prev_data = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(mem_data + prev_i));
+		auto cur_data = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(mem_data + i));
+		prev_data = _mm_shufflelo_epi16(prev_data, _MM_SHUFFLE(3, 3, 1, 0));
+		cur_data = _mm_shufflelo_epi16(cur_data, _MM_SHUFFLE(1, 2, 1, 0));
+		auto diff = _mm_sub_epi16(cur_data, prev_data);
+		auto cmp = _mm_movemask_epi8(_mm_cmpgt_epi16(diff, _mm_set_epi16(
+			0x7fff, 0x7fff, 0x7fff, 0x7fff,
+			-1, // mem_start[i] >= mem_end[prev_i]
+			 3, // ((mem_val[i] + (1<<LZ77_LITERAL_BITCOST_LOG2)/2)>>LZ77_LITERAL_BITCOST_LOG2) - (mem_end[prev_i] - mem_start[i]) > 3   [3 = fudge factor for cost of len/dist symbols]
+			 3, // mem_start[i] - mem_start[prev_i] > 3
+			 1  // mem_val[i] - mem_val[prev_i] > 1
+		)));
+		
+		selected |= (cmp >= 0b00111100) << prev_i; // if current doesn't conflict with previous, select previous
+		#if defined(__GNUC__) || defined(__clang__)
+		asm("testb $0b11000011, %b[cmp]\n"
+		    "cmovnz %[i], %[prev_i]\n"
+		  : [prev_i]"+r"(prev_i)
+		  : [i]"r"(i), [cmp]"r"(cmp)
+		  :);
+		#else
+		lz77_cmov(prev_i, cmp & 0b11000011, i); // if current match looks promising, set is as the next candidate
+		#endif
 	}
 	selected |= 1 << prev_i;
-	skip_til_index = mem_end[prev_i];
+	skip_til_index = mem_data[prev_i] >> 48;
 	
 	uint32_t selected_match = _pdep_u32(selected, _cvtmask32_u32(match));
 	auto selected_match_m = _cvtu32_mask32(selected_match);
@@ -704,12 +740,12 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	auto cstart = _mm512_mask_compress_epi16(
 		_mm512_set1_epi16(-1),  // ensure the last 'shorten' element is 0
 		_cvtu32_mask32(_blsr_u32(selected_match)), // clearing lowest bit here will effectively shift it by 1 element
-		_mm512_cvtepu8_epi16(match_indices)
+		match_start
 	);
 	
 	auto shorten = _mm512_cvtepi16_epi8(_mm512_subs_epu16(cend, cstart));
 	shorten = _mm256_maskz_expand_epi8(selected_match_m, shorten);
-	assert(_mm256_cmplt_epu8(matched_lengths_sub3, shorten) == 0);
+	assert(_mm256_cmplt_epu8_mask(matched_lengths_sub3, shorten) == 0);
 	matched_lengths_sub3 = _mm256_sub_epi8(matched_lengths_sub3, shorten);
 	
 	return selected_match;
