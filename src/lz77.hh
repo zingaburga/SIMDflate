@@ -643,7 +643,7 @@ static HEDLEY_ALWAYS_INLINE void lz77_cmov(T& dest, bool cond, T new_val) {
 }
 
 static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256i match_indices, __m512i match_value, __mmask32 match, int& skip_til_index) {
-	// compress down
+	// generate comparison values
 	auto match_start = _mm512_cvtepu8_epi16(match_indices);
 	auto match_offset = _mm512_add_epi16(match_start, _mm512_set1_epi16(3));
 	auto match_end = _mm512_add_epi16(_mm512_cvtepu8_epi16(matched_lengths_sub3), match_offset);
@@ -651,11 +651,13 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	auto match_shorten = _mm512_srli_epi16(match_value, LZ77_LITERAL_BITCOST_LOG2);
 	match_shorten = _mm512_add_epi16(match_shorten, match_start);
 	
+	// compress down so only relevant items are checked
 	auto compressed_end = _mm512_maskz_compress_epi16(match, match_end);
 	auto compressed_shorten = _mm512_maskz_compress_epi16(match, match_shorten);
 	auto compressed_start = _mm512_maskz_compress_epi16(match, match_start);
 	auto compressed_value = _mm512_maskz_compress_epi16(match, match_value);
 	
+	// transpose
 	const auto PERM32 = _mm512_set_epi32(15, 11, 7, 3,  14, 10, 6, 2,  13, 9, 5, 1,  12, 8, 4, 0);
 	compressed_end = _mm512_permutexvar_epi32(PERM32, compressed_end);
 	compressed_shorten = _mm512_permutexvar_epi32(PERM32, compressed_shorten);
@@ -667,11 +669,14 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	auto tmp3 = _mm512_unpacklo_epi16(compressed_value, compressed_start);
 	auto tmp4 = _mm512_unpackhi_epi16(compressed_value, compressed_start);
 	
-	alignas(64) uint64_t mem_data[32];
+	// store out for main loop
+	alignas(64) uint64_t mem_data[32 +4];
 	_mm512_store_si512(mem_data, _mm512_unpacklo_epi32(tmp3, tmp1));
 	_mm512_store_si512(mem_data + 8, _mm512_unpackhi_epi32(tmp3, tmp1));
 	_mm512_store_si512(mem_data + 16, _mm512_unpacklo_epi32(tmp4, tmp2));
 	_mm512_store_si512(mem_data + 24, _mm512_unpackhi_epi32(tmp4, tmp2));
+	// extra padding
+	_mm256_store_si256(reinterpret_cast<__m256i*>(mem_data + 32), _mm256_set1_epi16(-1));
 	
 	unsigned num_match = _mm_popcnt_u32(_cvtmask32_u32(match));
 	assert(num_match > 0);
@@ -681,54 +686,45 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	uint32_t selected = 0;
 	for(unsigned i=1; i<num_match; i++) {
 		ASSUME(prev_i < i);
-		/*  scalar version
-		if(mem_end[prev_i] > mem_start[i]) {
-			// conflict
-			if(mem_start[i] - mem_start[prev_i] >= 4 && mem_val[i] - ((mem_end[prev_i] - mem_start[i]) << LZ77_LITERAL_BITCOST_LOG2) > (3 << LZ77_LITERAL_BITCOST_LOG2)) {
-				//   ^ 3 = fudge factor as an approximate cost of the len/dist symbols themselves
-				// shorten previous match and select it
-				if(prev_prev_i >= 0 && !((selected >> (prev_i-1)) & 1) && mem_end[prev_i-1] >= mem_start[i]) {
-					// TODO: evaluate whether this should be selected instead
-				}
-				mem_end[prev_i] = mem_start[i];
-				selected |= 1 << prev_i;
-			}
-			else if(mem_val[i] - mem_val[prev_i] <= 1) // slightly bias towards earlier match, as it's less likely to conflict
-				continue; // discard this match
-			else {
-				// discard earlier match
-				// TODO: check preceeding to see if it was better
-			}
+		
+		auto prev_data = _mm256_broadcastq_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(mem_data + prev_i)));
+		auto cur_data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(mem_data + i));
+		prev_data = _mm256_shuffle_epi8(prev_data, _mm256_set_epi64x(  // rearrange to [value, start, end, end]
+			0x0f0e'0f0e'0b0a'0908, 0x0706'0706'0302'0100,
+			0x0f0e'0f0e'0b0a'0908, 0x0706'0706'0302'0100
+		));
+		cur_data = _mm256_shuffle_epi8(cur_data, _mm256_set_epi64x(  // rearrange to [value, start, shorten, start]
+			0x0b0a'0d0c'0b0a'0908, 0x0302'0504'0302'0100,
+			0x0b0a'0d0c'0b0a'0908, 0x0302'0504'0302'0100
+		));
+		auto diff = _mm256_sub_epi16(cur_data, prev_data);
+		auto cmp = _mm256_cmpgt_epi16(diff, _mm256_set1_epi64x(
+			0xffff'0003'0003'0001
+			// start[i] >= end[prev_i]
+			// ((value[i] + (1<<LZ77_LITERAL_BITCOST_LOG2)/2)>>LZ77_LITERAL_BITCOST_LOG2) - (end[prev_i] - start[i]) > 3   [3 = fudge factor for cost of len/dist symbols]
+			// start[i] - start[prev_i] > 3
+			// value[i] - value[prev_i] > 1
+		));
+		auto advance_i = _mm256_movemask_epi8(cmp) & 0x41414141;
+		auto selcmp = _cvtmask16_u32(_mm256_cmpge_epu64_mask(cmp, _mm256_set1_epi64x(0x0000ffffffff0000)));
+		
+		int skip_i = _tzcnt_u32(advance_i | 0x80000000)>>3;
+		i += skip_i;
+		selected |= (_bzhi_u32(selcmp, skip_i+1) != 0) << prev_i;
+		lz77_cmov(prev_i, advance_i, i);
+		
+		/*  if compiler refuses to use CMOV, this might be better
+		if(advance_i) {
+			// prev_i advances - find to where it does
+			int skip_i = _tzcnt_u32(advance_i)>>3;
+			i += skip_i;
+			selected |= (_bzhi_u32(selcmp, skip_i+1) != 0) << prev_i;
+			prev_i = i;
 		} else {
-			selected |= 1 << prev_i;
+			selected |= (selcmp!=0) << prev_i;
+			i += 3;
 		}
-		prev_prev_i = prev_i;
-		prev_i = i;
 		*/
-		
-		auto prev_data = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(mem_data + prev_i));
-		auto cur_data = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(mem_data + i));
-		prev_data = _mm_shufflelo_epi16(prev_data, _MM_SHUFFLE(3, 3, 1, 0));
-		cur_data = _mm_shufflelo_epi16(cur_data, _MM_SHUFFLE(1, 2, 1, 0));
-		auto diff = _mm_sub_epi16(cur_data, prev_data);
-		auto cmp = _mm_movemask_epi8(_mm_cmpgt_epi16(diff, _mm_set_epi16(
-			0x7fff, 0x7fff, 0x7fff, 0x7fff,
-			-1, // mem_start[i] >= mem_end[prev_i]
-			 3, // ((mem_val[i] + (1<<LZ77_LITERAL_BITCOST_LOG2)/2)>>LZ77_LITERAL_BITCOST_LOG2) - (mem_end[prev_i] - mem_start[i]) > 3   [3 = fudge factor for cost of len/dist symbols]
-			 3, // mem_start[i] - mem_start[prev_i] > 3
-			 1  // mem_val[i] - mem_val[prev_i] > 1
-		)));
-		
-		selected |= (cmp >= 0b00111100) << prev_i; // if current doesn't conflict with previous, select previous
-		#if defined(__GNUC__) || defined(__clang__)
-		asm("testb $0b11000011, %b[cmp]\n"
-		    "cmovnz %[i], %[prev_i]\n"
-		  : [prev_i]"+r"(prev_i)
-		  : [i]"r"(i), [cmp]"r"(cmp)
-		  :);
-		#else
-		lz77_cmov(prev_i, cmp & 0b11000011, i); // if current match looks promising, set is as the next candidate
-		#endif
 	}
 	selected |= 1 << prev_i;
 	skip_til_index = mem_data[prev_i] >> 48;
