@@ -407,9 +407,10 @@ static __m256i lz77_get_match_len_long(size_t avail_len, __mmask32 long_matches,
 		assert(_mm_cvtsi128_si32(_mm256_castsi256_si128(_mm256_maskz_compress_epi8(long_matches, match_len))) == 8+64);
 		
 		int long_len = 8+64;
+		// TODO: consider unrolling this loop; also allows long_len check at end to be eliminated if masked compares are used
 		for(int i=0; i<3; i++) {
 			if(HEDLEY_UNLIKELY(avail_len < 12 + (i+3)*sizeof(__m512i)))
-				break; // TODO: handle partial loads
+				break;
 			
 			long_offset += sizeof(__m512i);
 			long_idx += sizeof(__m512i);
@@ -423,7 +424,7 @@ static __m256i lz77_get_match_len_long(size_t avail_len, __mmask32 long_matches,
 		}
 		if(long_len > 254) long_len = 254;  // DEFLATE's max match length is 258 (length is later saturated to this amount, so we could also threshold at 255 here)
 		match_len = _mm256_mask_expand_epi8(match_len, long_matches, _mm256_castsi128_si256(_mm_cvtsi32_si128(long_len)));
-		// TODO: also wipe the match mask after this, to lessen conflict resolution
+		// TODO: also wipe the match mask after this, to lessen load on conflict resolution
 	}
 	return match_len;
 }
@@ -728,6 +729,72 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	}
 	selected |= 1 << prev_i;
 	skip_til_index = mem_data[prev_i] >> 48;
+	
+	/*
+	// refinement pass - the above selection may select suboptimal matches in some circumstances (due to being greedy with neighboring conflicts); this should fix up most missed opportunities
+	// benefit isn't that big overall though, but maybe there's a quick way to do it
+	// TODO: optimisations
+	unsigned next_i = _tzcnt_u32(selected);
+	auto test_selected = _blsr_u32(selected);
+	uint16_t pos = 0;
+	for(unsigned i=0; i<num_match; i++) {
+		auto data = mem_data[i];
+		uint16_t end = data >> 48;
+		if(next_i == i) {
+			if(!test_selected) break;
+			next_i = _tzcnt_u32(test_selected);
+			test_selected = _blsr_u32(test_selected);
+			pos = end;
+		} else {
+			auto next_data = mem_data[next_i];
+			// if current match conflicts with previous, skip it
+			uint16_t start = data >> 16;
+			if(start < pos) continue;
+			uint16_t next_start = next_data >> 16;
+			
+			// if current match doesn't conflict (or can be shortened to not) with next, select it
+			if(end <= next_start || start + 4 <= next_start) {
+				selected |= 1 << i;
+				pos = end;
+			}
+			// if current match is worth more than next, discard next and select current
+			// (this seems to require a lot of effort, but doesn't yield all that much benefit)
+			else {
+				// determine value of next match
+				int16_t next_val = next_data;
+				if(test_selected) {
+					// this might be a shortened match
+					unsigned next_next_i = _tzcnt_u32(test_selected);;
+					uint16_t next_next_start = mem_data[next_next_i] >> 16;
+					assert(next_start + 4 <= next_next_start);
+					uint16_t next_end = next_data >> 48;
+					if(next_next_start < next_end) {
+						// conflict, so shorten
+						next_val -= (next_end - next_next_start) << LZ77_LITERAL_BITCOST_LOG2;
+					}
+				}
+				// determine value of current
+				int16_t cur_val = data;
+				if(end > next_start) {
+					// need to shorten current
+					if(start + 4 > next_start) continue; // cannot shorten
+					cur_val -= (end - next_start) << LZ77_LITERAL_BITCOST_LOG2;
+				}
+				
+				if(cur_val - next_val > -1) {
+					selected ^= 1 << next_i;
+					selected |= 1 << i;
+					
+					if(!test_selected) break;
+					i = next_i; // since we've found a better match, and that match conflicts with th originally selected one, all matches in between are guaranteed to conflict, so just skip on forward
+					next_i = _tzcnt_u32(test_selected);
+					test_selected = _blsr_u32(test_selected);
+					pos = end;
+				}
+			}
+		}
+	}
+	*/
 	
 	uint32_t selected_match = _pdep_u32(selected, _cvtmask32_u32(match));
 	auto selected_match_m = _cvtu32_mask32(selected_match);
