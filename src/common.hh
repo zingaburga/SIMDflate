@@ -83,6 +83,13 @@ static HEDLEY_ALWAYS_INLINE __m512i make_vec512_epi16(fn&& f) {
 	);
 }
 #define VEC512_16(...) make_vec512_epi16([&](int _x){ return __VA_ARGS__; })
+template<typename fn>
+static HEDLEY_ALWAYS_INLINE __m256i make_vec256_epi8(fn&& f) {
+	return _mm256_set_epi8(
+		f(31), f(30), f(29), f(28), f(27), f(26), f(25), f(24), f(23), f(22), f(21), f(20), f(19), f(18), f(17), f(16), f(15), f(14), f(13), f(12), f(11), f(10), f(9), f(8), f(7), f(6), f(5), f(4), f(3), f(2), f(1), f(0)
+	);
+}
+#define VEC256_8(...) make_vec256_epi8([&](int _x){ return __VA_ARGS__; })
 
 
 // shortcut for looping over an array using 512-bit vectors, masking appropriately for the tail

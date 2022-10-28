@@ -1106,7 +1106,7 @@ public:
 			auto code0 = _mm256_setzero_si256();
 			auto cmp = VEC512_8(_x/32+1);
 			
-			const auto INDICES = _mm256_set_epi8(31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0);
+			const auto INDICES = VEC256_8(_x);
 			auto cmp_2round = [&]() -> uint64_t {
 				auto len_match = _mm512_cmpeq_epi8_mask(sym_len, cmp);
 				code0 = _mm256_mask_expand_epi8(code0, len_match, INDICES);

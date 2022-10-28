@@ -643,7 +643,7 @@ static HEDLEY_ALWAYS_INLINE void lz77_cmov(T& dest, bool cond, T new_val) {
 	*/
 }
 
-static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256i match_indices, __m512i match_value, __mmask32 match, int& skip_til_index, __mmask32& selected_mask) {
+static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256i match_indices, __m512i match_value, __mmask32& match, int& skip_til_index) {
 	// generate comparison values
 	auto match_start = _mm512_cvtepu8_epi16(match_indices);
 	auto match_offset = _mm512_add_epi16(match_start, _mm512_set1_epi16(3));
@@ -735,7 +735,7 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	// refinement pass - the above selection may select suboptimal matches in some circumstances (due to being greedy with neighboring conflicts); this should pick up a bunch of missed opportunities
 	// benefit isn't great, but it might be possible to optimise this so that the speed cost is small as well?
 	const auto MAX_IDX = _mm256_set1_epi8(-1);
-	selected_mask = _cvtu32_mask32(selected);
+	auto selected_mask = _cvtu32_mask32(selected);
 	// generate an index for gathering appropriate start/end locations
 	auto selected_idx = _mm256_mask_blend_epi8(selected_mask, MAX_IDX, VEC256_8(_x));
 	selected_idx = _mm256_min_epu8(selected_idx, _mm256_permute2x128_si256(selected_idx, MAX_IDX, 0x31));
@@ -864,6 +864,7 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	assert(_mm256_cmplt_epu8_mask(matched_lengths_sub3, shorten) == 0);
 	matched_lengths_sub3 = _mm256_sub_epi8(matched_lengths_sub3, shorten);
 	
+	match = selected_mask;
 	return selected_match;
 }
 
@@ -1142,7 +1143,7 @@ static unsigned lz77_vec(__m512i data, __m512i data2, uint32_t* match_offsets, c
 	// we'll eventually need the length-3 value later on, so compute it by saturation
 	auto matched_lengths_sub3 = _mm256_adds_epu8(matched_lengths_sub4, _mm256_set1_epi8(1));
 	
-	auto match_i = lz77_resolve_conflict_mask(matched_lengths_sub3, match_indices, match_value, match, skip_til_index, match);
+	auto match_i = lz77_resolve_conflict_mask(matched_lengths_sub3, match_indices, match_value, match, skip_til_index);
 	int num_match = _mm_popcnt_u32(match_i);
 	uint64_t idx_mask = _pdep_u64(match_i, bounds);
 	
