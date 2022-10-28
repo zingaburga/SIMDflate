@@ -8,7 +8,7 @@ This is an experimental speed-oriented [DEFLATE](https://en.wikipedia.org/wiki/D
 * Requires an x86-64 CPU with **“*Ice Lake* level” AVX-512 support**
 * Design is not easily portable to other ISAs
 
-This code serves more as a demonstration of what can be achieved if we disregard compatibility concerns, and perhaps act as a showcase of what can be done with AVX-512.  The limitations means that this isn’t really a general-purpose compressor, but this might be improved.
+This code serves more as a demonstration of what can be achieved if we disregard compatibility concerns, and perhaps act as a showcase of what can be done with AVX-512.  The limitations means that this isn’t really a general-purpose compressor, but this might be improved.  
 It's currently very early in development, which means that it isn’t well geared for production use, lacks features/functionality, likely has bugs (not extensively tested), code poorly documented etc.
 
 ## Non-goals of this project
@@ -20,7 +20,7 @@ It's currently very early in development, which means that it isn’t well geare
 
 ## Required AVX-512 support / Compatible CPUs
 
-This implementation makes extensive use of relatively [new AVX-512 instructions introduced in Intel’s Ice Lake](https://branchfree.org/2019/05/29/why-ice-lake-is-important-a-bit-bashers-perspective/) microarchitecture.  In fact, it uses all AVX-512 subsets supported on Ice Lake (as well as the [BMI1 and BMI2 instruction sets](https://en.wikipedia.org/wiki/X86_Bit_manipulation_instruction_set)) except DQ, BITALG and VAES, or put another way, it uses the following [AVX-512 subsets](https://en.wikipedia.org/wiki/AVX-512#New_instructions_by_sets): F, BW, CD, VL, VBMI, VBMI2, GFNI, VPOPCNTDQ, VPCLMULQDQ, IFMA, VNNI.
+This implementation makes extensive use of relatively [new AVX-512 instructions introduced in Intel’s Ice Lake](https://branchfree.org/2019/05/29/why-ice-lake-is-important-a-bit-bashers-perspective/) microarchitecture.  In fact, it uses all AVX-512 subsets supported on Ice Lake (as well as the [BMI1 and BMI2 instruction sets](https://en.wikipedia.org/wiki/X86_Bit_manipulation_instruction_set)) except DQ and VAES, or put another way, it uses the following [AVX-512 subsets](https://en.wikipedia.org/wiki/AVX-512#New_instructions_by_sets): F, BW, CD, VL, VBMI, VBMI2, BITALG, VPOPCNTDQ, GFNI, VPCLMULQDQ, IFMA, VNNI.
 
 Don’t worry if the above is confusing - the following is a list of compatible processors at time of writing:
 
@@ -31,7 +31,8 @@ Don’t worry if the above is confusing - the following is a list of compatible 
 * Intel [desktop Alder Lake](https://ark.intel.com/content/www/us/en/ark/products/codename/147470/products-formerly-alder-lake.html#@Desktop) (12th generation Core) may have [unofficial support](https://github.com/zingaburga/alderlake_avx512/wiki)
   * Expected to be *un*available on [Raptor Lake](https://en.wikipedia.org/wiki/Raptor_Lake) (13th gen Core) and [probably Meteor Lake](https://twitter.com/InstLatX64/status/1552372740409147393) (14th gen Core)
   * Likely will be available on [Alder Lake-X](https://videocardz.com/newz/intel-sapphire-rapids-hedt-fishhawk-falls-cpu-has-been-spotted-with-16-cores) and later Intel *high-end desktop* or *workstation* platforms
-* Intel [Sapphire Rapids](https://en.wikipedia.org/wiki/Sapphire_Rapids) (4th gen Xeon Scalable) or later
+* Intel [Sapphire Rapids](https://en.wikipedia.org/wiki/Sapphire_Rapids) (4th gen Xeon Scalable) or later P-core based Xeons
+  * Considering Intel's continuing to [port EVEX instructions to VEX](https://twitter.com/InstLatX64/status/1576554705182162945) for [Sierra Forest](https://en.wikipedia.org/wiki/Sierra_Forest) (Crestmont cores?), it's likely unsupported on future E-core based Xeons
 * AMD [Zen 4](https://en.wikipedia.org/wiki/Zen_4) (most Ryzen 7000 and 4th generation EPYC processors, including [Zen 4c](https://images.anandtech.com/doci/17055/image_2021_11_08T15_17_57_082Z.png) variants) or later
   * As these weren’t available at the time of writing, SIMDflate has been primarily developed/optimised on Intel’s AVX-512 implementation
 
