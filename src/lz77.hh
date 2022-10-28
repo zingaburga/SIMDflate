@@ -643,7 +643,7 @@ static HEDLEY_ALWAYS_INLINE void lz77_cmov(T& dest, bool cond, T new_val) {
 	*/
 }
 
-static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256i match_indices, __m512i match_value, __mmask32 match, int& skip_til_index) {
+static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256i match_indices, __m512i match_value, __mmask32 match, int& skip_til_index, __mmask32& selected_mask) {
 	// generate comparison values
 	auto match_start = _mm512_cvtepu8_epi16(match_indices);
 	auto match_offset = _mm512_add_epi16(match_start, _mm512_set1_epi16(3));
@@ -660,15 +660,15 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	
 	// transpose
 	const auto PERM32 = _mm512_set_epi32(15, 11, 7, 3,  14, 10, 6, 2,  13, 9, 5, 1,  12, 8, 4, 0);
-	compressed_end = _mm512_permutexvar_epi32(PERM32, compressed_end);
-	compressed_shorten = _mm512_permutexvar_epi32(PERM32, compressed_shorten);
-	compressed_start = _mm512_permutexvar_epi32(PERM32, compressed_start);
-	compressed_value = _mm512_permutexvar_epi32(PERM32, compressed_value);
+	auto trans_end = _mm512_permutexvar_epi32(PERM32, compressed_end);
+	auto trans_shorten = _mm512_permutexvar_epi32(PERM32, compressed_shorten);
+	auto trans_start = _mm512_permutexvar_epi32(PERM32, compressed_start);
+	auto trans_value = _mm512_permutexvar_epi32(PERM32, compressed_value);
 	
-	auto tmp1 = _mm512_unpacklo_epi16(compressed_shorten, compressed_end);
-	auto tmp2 = _mm512_unpackhi_epi16(compressed_shorten, compressed_end);
-	auto tmp3 = _mm512_unpacklo_epi16(compressed_value, compressed_start);
-	auto tmp4 = _mm512_unpackhi_epi16(compressed_value, compressed_start);
+	auto tmp1 = _mm512_unpacklo_epi16(trans_shorten, trans_end);
+	auto tmp2 = _mm512_unpackhi_epi16(trans_shorten, trans_end);
+	auto tmp3 = _mm512_unpacklo_epi16(trans_value, trans_start);
+	auto tmp4 = _mm512_unpackhi_epi16(trans_value, trans_start);
 	
 	// store out for main loop
 	alignas(64) uint64_t mem_data[32 +4];
@@ -730,10 +730,63 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	selected |= 1 << prev_i;
 	skip_til_index = mem_data[prev_i] >> 48;
 	
+	
+	
+	// refinement pass - the above selection may select suboptimal matches in some circumstances (due to being greedy with neighboring conflicts); this should pick up a bunch of missed opportunities
+	// benefit isn't great, but it might be possible to optimise this so that the speed cost is small as well?
+	const auto MAX_IDX = _mm256_set1_epi8(-1);
+	selected_mask = _cvtu32_mask32(selected);
+	// generate an index for gathering appropriate start/end locations
+	auto selected_idx = _mm256_mask_blend_epi8(selected_mask, MAX_IDX, VEC256_8(_x));
+	selected_idx = _mm256_min_epu8(selected_idx, _mm256_permute2x128_si256(selected_idx, MAX_IDX, 0x31));
+	selected_idx = _mm256_min_epu8(selected_idx, _mm256_alignr_epi64(MAX_IDX, selected_idx, 1));
+	selected_idx = _mm256_min_epu8(selected_idx, _mm256_alignr_epi32(MAX_IDX, selected_idx, 1));
+	selected_idx = _mm256_min_epu8(selected_idx, _mm256_permutexvar_epi8(VEC256_8(_x>29?31:_x+2), selected_idx));
+	selected_idx = _mm256_min_epu8(selected_idx, _mm256_permutexvar_epi8(VEC256_8(_x==31?31:_x+1), selected_idx));
+	
+	auto compressed_start8 = _mm512_cvtepi16_epi8(compressed_start);
+	// 'max_start' is actually +1 over the max, i.e. start < max_start needs to be true
+	// this is done to solve the underflow issue with subtracting
+	auto valid_max_start = _mm256_cmpneq_epi8_mask(selected_idx, MAX_IDX);
+	auto max_start = _mm256_subs_epu8(_mm256_maskz_permutexvar_epi8(valid_max_start, selected_idx, compressed_start8), _mm256_set1_epi8(3));
+	
+	// shift indices across one place
+	auto selected_idx_l1 = _mm256_maskz_compress_epi8(selected_mask, VEC256_8(_x));
+	selected_idx_l1 = _mm256_mask_permutexvar_epi8(MAX_IDX, _cvtu32_mask32(~1), VEC256_8(_x?_x-1:0), selected_idx_l1);
+	selected_idx_l1 = _mm256_mask_expand_epi8(MAX_IDX, selected_mask, selected_idx_l1); // maskz probably also works
+	selected_idx_l1 = _mm256_permutexvar_epi8(selected_idx, selected_idx_l1);
+	
+	// using signed saturation here, as 127 is large enough to be invalid
+	auto valid_min_start = _mm256_cmpneq_epi8_mask(selected_idx_l1, MAX_IDX);
+	auto min_start = _mm256_maskz_permutexvar_epi8(valid_min_start, selected_idx_l1, _mm512_cvtsepi16_epi8(compressed_end));
+	
+	// compare start with min/max
+	auto selectable = _mm256_mask_cmpge_epi8_mask(_knot_mask32(selected_mask), compressed_start8, min_start);
+	selectable = _mm256_mask_cmplt_epi8_mask(selectable, compressed_start8, max_start);
+	
+	/* alternative idea
+	assert(_mm_popcnt_u32(selected) <= 16); // min match len is 4B, so can't have more than 16 in 64 bytes
+	
+	_mm_cmpestrm(
+		_mm256_castsi256_si128(_mm256_maskz_compress_epi8(selected_mask, VEC256_8(_x))),
+		_mm_popcnt_u32(selected),
+		,
+		,
+		_SIDD_SBYTE_OPS | _SIDD_CMP_RANGES | _SIDD_BIT_MASK
+	);
+	*/
+	
+	// limit to first in each group
+	// because valid items are guaranteed to be consecutively grouped, getting the first can be done via the following
+	uint32_t selectable_i = _cvtmask32_u32(selectable);
+	assert(selectable_i < selected);
+	assert((selectable_i & selected) == 0);
+	selectable_i &= ~(selectable_i << 1);
+	selected |= selectable_i;
+	
+	
 	/*
-	// refinement pass - the above selection may select suboptimal matches in some circumstances (due to being greedy with neighboring conflicts); this should fix up most missed opportunities
-	// benefit isn't that big overall though, but maybe there's a quick way to do it
-	// TODO: optimisations
+	// slower, more accurate version of above
 	unsigned next_i = _tzcnt_u32(selected);
 	auto test_selected = _blsr_u32(selected);
 	uint16_t pos = 0;
@@ -797,9 +850,9 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	*/
 	
 	uint32_t selected_match = _pdep_u32(selected, _cvtmask32_u32(match));
-	auto selected_match_m = _cvtu32_mask32(selected_match);
+	selected_mask = _cvtu32_mask32(selected_match);
 	// check for overlong matches, due to length shortening
-	auto cend = _mm512_maskz_compress_epi16(selected_match_m, match_end);
+	auto cend = _mm512_maskz_compress_epi16(selected_mask, match_end);
 	auto cstart = _mm512_mask_compress_epi16(
 		_mm512_set1_epi16(-1),  // ensure the last 'shorten' element is 0
 		_cvtu32_mask32(_blsr_u32(selected_match)), // clearing lowest bit here will effectively shift it by 1 element
@@ -807,7 +860,7 @@ static uint32_t lz77_resolve_conflict_mask(__m256i& matched_lengths_sub3, __m256
 	);
 	
 	auto shorten = _mm512_cvtepi16_epi8(_mm512_subs_epu16(cend, cstart));
-	shorten = _mm256_maskz_expand_epi8(selected_match_m, shorten);
+	shorten = _mm256_maskz_expand_epi8(selected_mask, shorten);
 	assert(_mm256_cmplt_epu8_mask(matched_lengths_sub3, shorten) == 0);
 	matched_lengths_sub3 = _mm256_sub_epi8(matched_lengths_sub3, shorten);
 	
@@ -1089,8 +1142,7 @@ static unsigned lz77_vec(__m512i data, __m512i data2, uint32_t* match_offsets, c
 	// we'll eventually need the length-3 value later on, so compute it by saturation
 	auto matched_lengths_sub3 = _mm256_adds_epu8(matched_lengths_sub4, _mm256_set1_epi8(1));
 	
-	auto match_i = lz77_resolve_conflict_mask(matched_lengths_sub3, match_indices, match_value, match, skip_til_index);
-	match = _cvtu32_mask32(match_i);
+	auto match_i = lz77_resolve_conflict_mask(matched_lengths_sub3, match_indices, match_value, match, skip_til_index, match);
 	int num_match = _mm_popcnt_u32(match_i);
 	uint64_t idx_mask = _pdep_u64(match_i, bounds);
 	
